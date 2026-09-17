@@ -26,12 +26,27 @@ int main() {
   SYMLA_SMOKE_CHECK(!solver.factorized());
 
   Eigen::SparseMatrix<double> A(2, 2);
-  A.insert(0, 0) = 1.0;
-  A.insert(1, 1) = 1.0;
+  A.insert(0, 0) = 2.0;
+  A.insert(1, 1) = 3.0;
 
+  // As of Phase 3, analyzePattern/factorize genuinely run (Phase 1 symbolic
+  // analysis + Phase 3 multifrontal numeric factorization) rather than
+  // throwing "not yet implemented".
+  solver.analyzePattern(A);
+  SYMLA_SMOKE_CHECK(solver.patternAnalyzed());
+  SYMLA_SMOKE_CHECK(!solver.factorized());
+
+  solver.factorize(A);
+  SYMLA_SMOKE_CHECK(solver.factorized());
+  SYMLA_SMOKE_CHECK(!solver.isSingular());
+  SYMLA_SMOKE_CHECK(solver.inertia().n_pos == 2);
+  SYMLA_SMOKE_CHECK(solver.inertia().n_neg == 0);
+  SYMLA_SMOKE_CHECK(solver.inertia().n_zero == 0);
+
+  // solve() is still Phase 4's job.
   bool threw = false;
   try {
-    solver.analyzePattern(A);
+    solver.solve(Eigen::MatrixXd::Zero(2, 1));
   } catch (const std::logic_error&) {
     threw = true;
   }

@@ -29,3 +29,14 @@ add_executable(symla_dense_kernel_test unit/dense_kernel_test.cpp)
 target_link_libraries(symla_dense_kernel_test PRIVATE symla::symla ${LAPACK_LIBRARY})
 target_include_directories(symla_dense_kernel_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/unit)
 add_test(NAME dense_kernel_test COMMAND symla_dense_kernel_test)
+
+# Phase 3: multifrontal numeric factorization.
+add_executable(symla_multifrontal_test unit/multifrontal_test.cpp)
+target_link_libraries(symla_multifrontal_test PRIVATE symla::symla)
+target_include_directories(symla_multifrontal_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/unit)
+add_test(NAME multifrontal_test COMMAND symla_multifrontal_test)
+
+add_executable(symla_multifrontal_correctness_test correctness/multifrontal_correctness_test.cpp)
+target_link_libraries(symla_multifrontal_correctness_test PRIVATE symla::symla)
+target_include_directories(symla_multifrontal_correctness_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/unit)
+add_test(NAME multifrontal_correctness_test COMMAND symla_multifrontal_correctness_test)

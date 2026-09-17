@@ -48,7 +48,7 @@
 #include <cmath>
 #include <vector>
 
-#include "symla/solver.hpp"  // symla::Inertia
+#include "symla/inertia.hpp"  // symla::Inertia
 
 namespace symla {
 
@@ -106,10 +106,34 @@ class DenseLDLT {
   //     delayed column) are left in an unspecified but harmless state; the
   //     caller (Phase 3) is expected to re-assemble delayed columns into
   //     the parent front rather than trust this kernel's output for them.
+  // `n_eligible` (Phase 3 extension): restricts which leading columns are
+  // allowed to be *chosen* as a pivot (either directly, at column k, or as
+  // the partner row/column r of a 1x1-swap or 2x2 pivot). Columns/rows at
+  // index >= n_eligible (e.g. a multifrontal front's not-yet-fully-summed
+  // ancestor rows) still fully participate in the trailing rank-1/rank-2
+  // symmetric updates once a pivot elsewhere is applied, but are never
+  // themselves pivoted -- exactly the "fully summed vs. not fully summed"
+  // distinction in the multifrontal method (Duff & Reid 1983 / Liu 1990).
+  // A sentinel of -1 (the default) means "all n columns are eligible",
+  // reproducing the original (Phase 2) behavior exactly.
+  //
+  // Implementation note: since n_eligible only restricts the *search* range
+  // for lambda/sigma/r (never the trailing-update extent, which always
+  // spans the full remaining n-k rows/cols), and swaps only ever occur
+  // between indices < n_eligible, physical positions >= n_eligible are
+  // never permuted (result.perm stays the identity there) and, if the loop
+  // stops early (k < n_eligible) because no acceptable pivot exists within
+  // the eligible block, A's trailing block from k onward already holds
+  // exactly the Schur complement with respect to the k successfully
+  // factored pivots -- i.e. it is directly usable as a multifrontal
+  // "generated element" / update matrix, not just "harmless but
+  // unspecified" as in the pure Phase 2 (n_eligible == n) case.
   static DenseLDLTResult factor(Eigen::Ref<MatrixX> A, MatrixX& D_out,
-                                 const DenseLDLTOptions& options = {}) {
+                                 const DenseLDLTOptions& options = {}, int n_eligible = -1) {
     const int n = static_cast<int>(A.rows());
     if (A.cols() != n) throw std::invalid_argument("DenseLDLT::factor: A must be square");
+    const int effEnd = (n_eligible < 0) ? n : n_eligible;
+    if (effEnd < 0 || effEnd > n) throw std::invalid_argument("DenseLDLT::factor: n_eligible out of range");
 
     const double alpha = (1.0 + std::sqrt(17.0)) / 8.0;
 
@@ -135,13 +159,15 @@ class DenseLDLT {
     };
 
     int k = 0;
-    while (k < n) {
-      const int m = n - k;  // trailing submatrix size
+    while (k < effEnd) {
+      const int m = n - k;  // trailing submatrix size (full, incl. ineligible rows)
 
-      // Step 1: lambda = max_{i>k} |A(i,k)|, at row r.
+      // Step 1: lambda = max_{k<i<effEnd} |A(i,k)|, at row r. Restricted to
+      // the eligible (fully-summed) block: an entry below the diagonal that
+      // lives in a not-fully-summed row can never become a pivot partner.
       double lambda = 0.0;
       int r = -1;
-      for (int i = k + 1; i < n; ++i) {
+      for (int i = k + 1; i < effEnd; ++i) {
         const double v = std::abs(A(i, k));
         if (v > lambda) {
           lambda = v;
@@ -152,7 +178,7 @@ class DenseLDLT {
       bool accept_1x1_at_k = false;
       bool accept_1x1_swap_kr = false;
 
-      if (m == 1 || lambda <= options.zero_tolerance) {
+      if (lambda <= options.zero_tolerance) {
         // No off-diagonal mass below the diagonal (or last column): accept
         // a 1x1 pivot at k directly. If A(k,k) itself is (numerically)
         // zero too, this is a structurally singular pivot -- signal a
@@ -164,9 +190,10 @@ class DenseLDLT {
       } else if (std::abs(A(k, k)) >= alpha * lambda) {
         accept_1x1_at_k = true;
       } else {
-        // sigma = max_{i != r, k<=i<n} |A(i,r)|
+        // sigma = max_{i != r, k<=i<effEnd} |A(i,r)| (restricted to the
+        // eligible block, same rationale as lambda above).
         double sigma = 0.0;
-        for (int i = k; i < n; ++i) {
+        for (int i = k; i < effEnd; ++i) {
           if (i == r) continue;
           const double v = std::abs(A(i, r));
           if (v > sigma) sigma = v;
@@ -320,7 +347,11 @@ class DenseLDLT {
     }
 
     result.n_factored = k;
-    for (int j = k; j < n; ++j) result.delayed_cols.push_back(j);
+    // Only columns within the eligible block that failed to pivot are
+    // "delayed" in the MA57 sense; ineligible rows/cols (>= effEnd, e.g. a
+    // multifrontal front's ancestor rows) were never candidates to begin
+    // with and must not be reported as delayed.
+    for (int j = k; j < effEnd; ++j) result.delayed_cols.push_back(j);
     result.max_growth = running_max / orig_max;
     return result;
   }

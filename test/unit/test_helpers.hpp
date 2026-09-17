@@ -124,4 +124,29 @@ inline std::vector<int> denseSymbolicCholeskyColCounts(const SparseMatrix& permu
   return colCount;
 }
 
+// Random sparse *indefinite* symmetric matrix: starts from randomSparseSPD
+// (diagonally dominant, so well-conditioned) and then flips the sign of a
+// random subset of diagonal entries. Off-diagonal magnitudes are untouched,
+// so each flipped row remains diagonally dominant (now around a negative
+// center), giving a matrix with a generic mix of positive and negative
+// eigenvalues (via Gershgorin) while staying safely away from exact
+// singularity -- suitable for full-pipeline residual/inertia correctness
+// tests (Phase 3) where the point is exercising indefinite threshold
+// pivoting/delayed pivots end to end, not stress-testing near-singularity
+// (that is test/stability's job, Phase 5).
+inline Eigen::SparseMatrix<double, Eigen::ColMajor, int> randomSparseIndefinite(int n, int avgNnzPerRow,
+                                                                                 unsigned seed) {
+  Eigen::SparseMatrix<double, Eigen::ColMajor, int> A = randomSparseSPD(n, avgNnzPerRow, seed);
+  std::mt19937 rng(seed ^ 0x9e3779b9u);
+  std::uniform_int_distribution<int> coin(0, 1);
+  for (int k = 0; k < A.outerSize(); ++k) {
+    for (Eigen::SparseMatrix<double, Eigen::ColMajor, int>::InnerIterator it(A, k); it; ++it) {
+      if (it.row() == it.col() && coin(rng) == 0) {
+        it.valueRef() = -it.value();
+      }
+    }
+  }
+  return A;
+}
+
 }  // namespace symla_test

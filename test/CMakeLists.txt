@@ -40,3 +40,10 @@ add_executable(symla_multifrontal_correctness_test correctness/multifrontal_corr
 target_link_libraries(symla_multifrontal_correctness_test PRIVATE symla::symla)
 target_include_directories(symla_multifrontal_correctness_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/unit)
 add_test(NAME multifrontal_correctness_test COMMAND symla_multifrontal_correctness_test)
+
+# Phase 4: multifrontal solve (forward/diag/back substitution over the
+# per-front factorization).
+add_executable(symla_solve_test correctness/solve_test.cpp)
+target_link_libraries(symla_solve_test PRIVATE symla::symla)
+target_include_directories(symla_solve_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/unit)
+add_test(NAME solve_test COMMAND symla_solve_test)

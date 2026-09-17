@@ -43,10 +43,18 @@ int main() {
   SYMLA_SMOKE_CHECK(solver.inertia().n_neg == 0);
   SYMLA_SMOKE_CHECK(solver.inertia().n_zero == 0);
 
-  // solve() is still Phase 4's job.
+  // As of Phase 4, solve() genuinely solves (diag(2,3) x = b).
+  Eigen::MatrixXd b(2, 1);
+  b << 4.0, 9.0;
+  Eigen::MatrixXd x = solver.solve(b);
+  SYMLA_SMOKE_CHECK(std::abs(x(0, 0) - 2.0) < 1e-12);
+  SYMLA_SMOKE_CHECK(std::abs(x(1, 0) - 3.0) < 1e-12);
+
+  // solve() still throws if called before factorize().
+  symla::SymLDLT<double> unfactored;
   bool threw = false;
   try {
-    solver.solve(Eigen::MatrixXd::Zero(2, 1));
+    unfactored.solve(Eigen::MatrixXd::Zero(2, 1));
   } catch (const std::logic_error&) {
     threw = true;
   }

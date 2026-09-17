@@ -7,6 +7,7 @@
 #include "symla/inertia.hpp"
 #include "symla/symbolic.hpp"
 #include "symla/multifrontal.hpp"
+#include "symla/solve.hpp"
 
 namespace symla {
 
@@ -58,9 +59,43 @@ class SymLDLT {
   // Re-factorize with new values on the same pattern (no re-analysis).
   void refactorize(const SparseMatrix& A) { factorize(A); }
 
+  // Multifrontal triangular solve (Phase 4), operating directly on the
+  // per-front sparse structure (see solve.hpp) -- never materializes a
+  // dense n x n matrix. Throws if `factorize()` has not been called yet.
+  //
+  // Design choice: if the factorization is numerically singular
+  // (`isSingular()`), this throws rather than attempting a best-effort
+  // solve. A singular factorization means one or more columns could never
+  // be pivoted anywhere in the tree, including at a root front, so the
+  // corresponding rows of `L`/`D` for those columns were never finalized
+  // (dense_kernel.hpp documents their state as "unspecified but harmless"
+  // for factorization purposes only) -- there is no well-defined
+  // `SupernodeFactor::pivotBlocks` entry to diagonal-solve against for
+  // them, so a "best effort" solve would either need ad hoc handling (e.g.
+  // treating them as a pseudo-inverse/least-squares step) or silently
+  // produce entries that are not just imprecise but structurally
+  // meaningless. Throwing keeps `solve()`'s contract simple and matches
+  // this project's existing convention of throwing on
+  // precondition/consistency violations (e.g. calling `factorize()` before
+  // `analyzePattern()`). Callers who legitimately need a solve against a
+  // rank-deficient system (e.g. KKT systems with detected zero pivots) are
+  // expected to use `isSingular()`/`singularColumns()` first and handle
+  // rank deficiency explicitly (Phase 7's KKT/regularization mode is the
+  // intended long-term answer for that use case, not a silent best-effort
+  // path here).
   DenseMatrix solve(const DenseMatrix& B) const {
-    (void)B;
-    throw std::logic_error("symla::SymLDLT::solve: not yet implemented (Phase 4)");
+    if (!factorized_) {
+      throw std::logic_error("symla::SymLDLT::solve: factorize() must be called before solve()");
+    }
+    if (numeric_.singular) {
+      throw std::logic_error(
+          "symla::SymLDLT::solve: factorization is numerically singular (see isSingular()/"
+          "singularColumns()); refusing to solve");
+    }
+    if (B.rows() != numeric_.n) {
+      throw std::invalid_argument("symla::SymLDLT::solve: B.rows() must match the factorized matrix size");
+    }
+    return MultifrontalSolver<Scalar>::solve(numeric_, B);
   }
 
   const Inertia& inertia() const { return inertia_; }

@@ -1,6 +1,7 @@
 build/
 build-*/
 bench/matrices/
+bench/results/
 *.o
 *.obj
 compile_commands.json

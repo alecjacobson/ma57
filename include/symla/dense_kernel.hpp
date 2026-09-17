@@ -69,8 +69,35 @@ struct DenseLDLTOptions {
   // Magnitudes at/below this are treated as structurally/numerically zero
   // when searching for a pivot (used both for the "lambda == 0" fast path
   // and for judging 2x2 pivot-block singularity / triggering delayed
-  // pivots).
+  // pivots). Deliberately tiny (near DBL_MIN) so it only catches literal
+  // (or bit-pattern-near) zeros, not "small relative to this matrix"
+  // values -- see `relative_pivot_floor` below for that.
   double zero_tolerance = 1e-300;
+
+  // Phase 5 fix (found via real-world SuiteSparse Collection matrices,
+  // e.g. GHS_indef/sit100 -- see test/correctness/real_matrix_test.cpp):
+  // a column that has *no* off-diagonal support at all within the current
+  // eligible block (lambda <= zero_tolerance, the "isolated diagonal"
+  // case) used to be force-accepted as a 1x1 pivot as long as |A(k,k)|
+  // exceeded the absurdly small `zero_tolerance` (1e-300) -- i.e.
+  // essentially always, even when A(k,k) was itself down at floating-point
+  // noise level (e.g. ~1e-40) relative to the rest of the matrix. Ordinary
+  // Bunch-Kaufman relative comparisons are intentionally scale-invariant
+  // (that's what gives the bounded-growth-factor guarantee) and are left
+  // untouched by this option, but the "isolated, no other candidate"
+  // fallback has no relative comparison to anchor it at all, so a
+  // catastrophically tiny isolated pivot would get divided into directly,
+  // blowing up L's multipliers (and hence the whole solve) by many orders
+  // of magnitude. MA57 itself avoids this by delaying such columns up the
+  // tree (where extend-add assembly with ancestor rows may give them real
+  // off-diagonal support) rather than pivoting on numerical noise. This
+  // option is that floor: an isolated column's |A(k,k)| must exceed
+  // `relative_pivot_floor * (max|entry| of the original front)` to be
+  // accepted directly; otherwise it is delayed (same code path as a
+  // genuinely-zero isolated diagonal). Expressed relative to the front's
+  // own scale (not an absolute constant) so it behaves consistently
+  // whether the matrix's natural magnitudes are ~1e-6 or ~1e6.
+  double relative_pivot_floor = 1e-12;
 };
 
 enum class PivotKind { OneByOne, TwoByTwo };
@@ -179,11 +206,17 @@ class DenseLDLT {
       bool accept_1x1_swap_kr = false;
 
       if (lambda <= options.zero_tolerance) {
-        // No off-diagonal mass below the diagonal (or last column): accept
-        // a 1x1 pivot at k directly. If A(k,k) itself is (numerically)
-        // zero too, this is a structurally singular pivot -- signal a
-        // delayed pivot rather than dividing by ~0.
-        if (std::abs(A(k, k)) <= options.zero_tolerance) {
+        // No off-diagonal mass below the diagonal (or last column): the
+        // only candidate is A(k,k) itself -- but accept it only if it's
+        // not down at noise level relative to this front's own scale (see
+        // `relative_pivot_floor`'s doc comment above). Either an
+        // exactly/near-zero isolated diagonal (structurally singular here)
+        // or a numerically negligible one are both handled the same way:
+        // delay column k (and everything after) to the parent, where
+        // extend-add assembly with ancestor rows may give it real
+        // off-diagonal support.
+        const double isolatedFloor = std::max(options.zero_tolerance, options.relative_pivot_floor * orig_max);
+        if (std::abs(A(k, k)) <= isolatedFloor) {
           break;  // delay column k (and everything after) to the parent
         }
         accept_1x1_at_k = true;
@@ -213,6 +246,21 @@ class DenseLDLT {
         // else: accept a 2x2 pivot at (k, r) -- handled by the fallthrough
         // block below (neither accept_1x1_at_k nor accept_1x1_swap_kr set).
       }
+
+      // Note: we deliberately do *not* apply an absolute floor to the
+      // ordinary (non-isolated) Bunch-Kaufman relative comparisons above --
+      // an experiment doing so (rejecting an about-to-be-accepted 1x1
+      // pivot whenever it fell below `relative_pivot_floor * orig_max`,
+      // falling through to try a 2x2 at (k, r) instead) was tried during
+      // Phase 5 and made real-matrix residuals *worse*, not better,
+      // presumably by forcing 2x2 pivots in cases the classical relative
+      // test had good (bounded-growth-factor) reasons to avoid. Left as a
+      // real, open item for Phase 6/7: see the Phase 5 report's notes on
+      // GHS_indef/sit100 and friends still showing elevated (~1e-2)
+      // residuals -- pure textbook Bunch-Kaufman is scale-invariant by
+      // design, and fixing this properly likely needs MA57/PARDISO-style
+      // static pivoting + regularization (already planned for Phase 7),
+      // not another ad hoc floor here.
 
       if (accept_1x1_at_k) {
         running_max = std::max(running_max, std::abs(A(k, k)));

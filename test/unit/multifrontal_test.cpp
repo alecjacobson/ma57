@@ -75,28 +75,42 @@ void testHandVerifiedIndefinite5x5() {
   SYMLA_CHECK(solver.inertia().n_zero == 0);
 }
 
-// Forces the delayed-pivot mechanism: an "arrow" matrix (hub column last)
-// with the two leaf diagonals set to exactly zero. Under natural ordering
-// this is the textbook arrow etree (elimination_tree_test.cpp): leaves 0
-// and 1 are single-column supernodes each with the hub as their only
-// off-diagonal entry, so their own fronts (front size 2: own column + hub
-// row, n_eligible == 1) can never pivot a zero diagonal with no eligible
-// partner -- both delay their entire column to the hub's supernode. The
-// hub's own two strong pivots are processed first (well-conditioned), and
-// the resulting rank-1 Schur-complement updates give the delayed leaf
-// diagonals nonzero values, so they successfully finalize *at the hub's
-// front* rather than their own -- i.e. this specifically exercises
-// cross-supernode delayed-pivot bookkeeping end to end.
+// Forces the delayed-pivot mechanism: an "arrow" matrix with a 3-column hub
+// {2,3,4} and two leaf columns 0,1 with exactly-zero diagonals, each
+// coupled to a *different* hub column (leaf 0 -> hub column 4, leaf 1 ->
+// hub column 3) so their own fronts (front size 2: own column + hub row,
+// n_eligible == 1) can never pivot a zero diagonal with no eligible partner
+// -- both delay their entire column to the hub's supernode.
+//
+// Phase 5 correction (found while adding real-matrix regression tests,
+// test/correctness/real_matrix_test.cpp): an earlier version of this test
+// had *both* leaves couple to the *same single* hub column (the original
+// arrow's hub was just one column). That is provably singular for any
+// choice of coupling magnitudes -- if leaves i,j both have a zero diagonal
+// and their *only* nonzero entries are a,b in the same column c, then rows
+// i,j satisfy b*row_i - a*row_j == 0 identically, i.e. rank-deficient by
+// construction, independent of a,b's actual values. The old test only
+// happened to "pass" because the pre-fix dense kernel would force-accept
+// even a catastrophically tiny (~1e-16, pure floating-point noise from that
+// exact algebraic cancellation) diagonal as a legitimate pivot -- the very
+// bug this project's Phase 5 real-matrix testing (see dense_kernel.hpp's
+// `relative_pivot_floor`) was written to catch and fix. Using two *distinct*
+// hub columns (3 and 4) avoids the rank collapse while preserving the
+// intended "two independent delayed columns finalize together at a shared
+// merged-supernode ancestor" scenario end to end.
 void testDelayedPivotArrow() {
-  const int n = 4;  // leaves 0,1,2 ; hub 3 (leaf 2 fundamentally merges into hub's supernode)
+  const int n = 5;  // leaves 0,1 ; hub {2,3,4} (a 3-column supernode)
   Eigen::MatrixXd A = Eigen::MatrixXd::Zero(n, n);
   A(0, 0) = 0.0;
   A(1, 1) = 0.0;
   A(2, 2) = 5.0;
-  A(3, 3) = 20.0;
-  A(0, 3) = A(3, 0) = 2.0;
-  A(1, 3) = A(3, 1) = 3.0;
-  A(2, 3) = A(3, 2) = 1.7;
+  A(3, 3) = 7.0;
+  A(4, 4) = 20.0;
+  A(2, 3) = A(3, 2) = 1.1;
+  A(3, 4) = A(4, 3) = 1.3;
+  A(2, 4) = A(4, 2) = 0.9;  // dense internal hub coupling so {2,3,4} fundamentally merges
+  A(0, 4) = A(4, 0) = 2.0;  // leaf 0 -> hub's *last* column
+  A(1, 3) = A(3, 1) = 1.7;  // leaf 1 -> hub's *middle* column (distinct from leaf 0's)
 
   Sparse S = fromDense(A);
   SymLDLT<double> solver;
@@ -106,10 +120,10 @@ void testDelayedPivotArrow() {
   const SymbolicFactor& sf = solver.symbolicFactor();
   // Sanity-check the assumed supernode shape before trusting the rest of
   // the test's reasoning in the comment above.
-  SYMLA_CHECK(sf.supernodes.size() == 3);  // {0}, {1}, {2,3}
+  SYMLA_CHECK(sf.supernodes.size() == 3);  // {0}, {1}, {2,3,4}
   SYMLA_CHECK(sf.supernodes[0].ncols == 1 && sf.supernodes[0].firstCol == 0);
   SYMLA_CHECK(sf.supernodes[1].ncols == 1 && sf.supernodes[1].firstCol == 1);
-  SYMLA_CHECK(sf.supernodes[2].ncols == 2 && sf.supernodes[2].firstCol == 2);
+  SYMLA_CHECK(sf.supernodes[2].ncols == 3 && sf.supernodes[2].firstCol == 2);
 
   solver.factorize(S);
   SYMLA_CHECK(solver.factorized());
@@ -121,8 +135,8 @@ void testDelayedPivotArrow() {
   SYMLA_CHECK(nf.fronts[0].nPivots == 0);
   SYMLA_CHECK(nf.fronts[1].nPivots == 0);
   // ...and the hub's front (with both leaves' delayed columns arriving as
-  // extra eligible columns) successfully finalizes all 4 pivots.
-  SYMLA_CHECK(nf.fronts[2].nPivots == 4);
+  // extra eligible columns) successfully finalizes all 5 pivots.
+  SYMLA_CHECK(nf.fronts[2].nPivots == 5);
   SYMLA_CHECK(nf.inertia.n_pos + nf.inertia.n_neg + nf.inertia.n_zero == n);
   SYMLA_CHECK(nf.inertia.n_zero == 0);
 
@@ -132,7 +146,7 @@ void testDelayedPivotArrow() {
   SYMLA_CHECK((rec - Ap).norm() / Ap.cwiseAbs().maxCoeff() < 1e-10);
 
   Eigen::VectorXd b(n);
-  b << 1, 2, 3, 4;
+  b << 1, 2, 3, 4, 5;
   Eigen::VectorXd x = symla_test::solveFlattened(nf, flat, b);
   double resid = (A * x - b).norm() / (A.cwiseAbs().maxCoeff() * x.norm() + b.norm());
   SYMLA_CHECK(resid < 1e-10);

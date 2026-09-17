@@ -47,3 +47,40 @@ add_executable(symla_solve_test correctness/solve_test.cpp)
 target_link_libraries(symla_solve_test PRIVATE symla::symla)
 target_include_directories(symla_solve_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/unit)
 add_test(NAME solve_test COMMAND symla_solve_test)
+
+# --- Phase 5: regression/benchmark suite ---
+
+# Synthetic block-arrow / KKT-shaped correctness tests.
+add_executable(symla_kkt_test correctness/kkt_test.cpp)
+target_link_libraries(symla_kkt_test PRIVATE symla::symla)
+target_include_directories(symla_kkt_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/unit)
+add_test(NAME kkt_test COMMAND symla_kkt_test)
+
+# Controlled-conditioning correctness fuzzing.
+add_executable(symla_conditioning_fuzz_test correctness/conditioning_fuzz_test.cpp)
+target_link_libraries(symla_conditioning_fuzz_test PRIVATE symla::symla)
+target_include_directories(symla_conditioning_fuzz_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/unit)
+add_test(NAME conditioning_fuzz_test COMMAND symla_conditioning_fuzz_test)
+
+# Real downloaded matrices (bench/fetch_matrices.py); skips gracefully if
+# bench/matrices/ hasn't been populated.
+add_executable(symla_real_matrix_test correctness/real_matrix_test.cpp)
+target_link_libraries(symla_real_matrix_test PRIVATE symla::symla)
+target_include_directories(symla_real_matrix_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/unit)
+add_test(NAME real_matrix_test COMMAND symla_real_matrix_test)
+
+# Stability stress tests.
+add_executable(symla_near_singular_test stability/near_singular_test.cpp)
+target_link_libraries(symla_near_singular_test PRIVATE symla::symla)
+target_include_directories(symla_near_singular_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/unit)
+add_test(NAME near_singular_test COMMAND symla_near_singular_test)
+
+add_executable(symla_zero_diagonal_test stability/zero_diagonal_test.cpp)
+target_link_libraries(symla_zero_diagonal_test PRIVATE symla::symla)
+target_include_directories(symla_zero_diagonal_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/unit)
+add_test(NAME zero_diagonal_test COMMAND symla_zero_diagonal_test)
+
+add_executable(symla_pivot_threshold_sweep_test stability/pivot_threshold_sweep_test.cpp)
+target_link_libraries(symla_pivot_threshold_sweep_test PRIVATE symla::symla)
+target_include_directories(symla_pivot_threshold_sweep_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/unit)
+add_test(NAME pivot_threshold_sweep_test COMMAND symla_pivot_threshold_sweep_test)

@@ -16,3 +16,16 @@ add_executable(symla_symbolic_test unit/symbolic_test.cpp)
 target_link_libraries(symla_symbolic_test PRIVATE symla::symla)
 target_include_directories(symla_symbolic_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/unit)
 add_test(NAME symbolic_test COMMAND symla_symbolic_test)
+
+# Dense frontal LDL^T kernel test: additionally links against the system
+# LAPACK (used purely as a black-box numerical oracle via dsytrf_/dsytrs_
+# for cross-checking residuals/inertia; no LAPACK source is used).
+find_library(LAPACK_LIBRARY NAMES lapack)
+if(NOT LAPACK_LIBRARY)
+  message(FATAL_ERROR "system liblapack not found; required by symla_dense_kernel_test as a numerical oracle")
+endif()
+
+add_executable(symla_dense_kernel_test unit/dense_kernel_test.cpp)
+target_link_libraries(symla_dense_kernel_test PRIVATE symla::symla ${LAPACK_LIBRARY})
+target_include_directories(symla_dense_kernel_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/unit)
+add_test(NAME dense_kernel_test COMMAND symla_dense_kernel_test)

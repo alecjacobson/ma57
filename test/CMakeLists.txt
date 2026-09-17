@@ -84,3 +84,10 @@ add_executable(symla_pivot_threshold_sweep_test stability/pivot_threshold_sweep_
 target_link_libraries(symla_pivot_threshold_sweep_test PRIVATE symla::symla)
 target_include_directories(symla_pivot_threshold_sweep_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/unit)
 add_test(NAME pivot_threshold_sweep_test COMMAND symla_pivot_threshold_sweep_test)
+
+# Scaling-regression guard: catches a recurrence of the Phase 5
+# factorize()-scaling bug (see the file's header comment for root cause).
+add_executable(symla_scaling_regression_test stability/scaling_regression_test.cpp)
+target_link_libraries(symla_scaling_regression_test PRIVATE symla::symla)
+target_include_directories(symla_scaling_regression_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/unit)
+add_test(NAME scaling_regression_test COMMAND symla_scaling_regression_test)

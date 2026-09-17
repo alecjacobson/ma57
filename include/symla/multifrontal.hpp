@@ -47,7 +47,28 @@
 #include <algorithm>
 #include <vector>
 
+#ifdef SYMLA_PROFILE
+#include <chrono>
+#include <cstdio>
+#endif
+
 namespace symla {
+
+#ifdef SYMLA_PROFILE
+struct MultifrontalProfile {
+  double extraFromChildrenSec = 0;
+  double extendSec = 0;
+  double addSec = 0;
+  double factorSec = 0;
+  long long numFronts = 0;
+  long long sumFrontSize = 0;
+  long long sumFrontSizeSq = 0;
+  double sumEligTimesMsq = 0;
+  long long maxFrontSize = 0;
+  int maxFrontNEligible = 0;
+};
+inline MultifrontalProfile g_mfProfile;
+#endif
 
 // One frontal matrix's finalized numeric contribution, stored in a form
 // close to what Phase 4's blocked forward/diag/back substitution wants:
@@ -236,6 +257,9 @@ class MultifrontalFactorizer {
       // --- Step A: collect "extra" indices delayed in from children that
       // are not already part of this supernode's symbolic row pattern
       // (i.e. genuinely new eligible columns arriving at runtime). ---
+#ifdef SYMLA_PROFILE
+      auto __tA0 = std::chrono::steady_clock::now();
+#endif
       std::vector<int> extraFromChildren;
       for (int ci : childrenSN[si]) {
         const auto& ge = genElem[ci];
@@ -264,6 +288,16 @@ class MultifrontalFactorizer {
 
       for (int t = 0; t < m; ++t) globalToLocal[frontIdx[t]] = t;
 
+#ifdef SYMLA_PROFILE
+      g_mfProfile.extraFromChildrenSec += std::chrono::duration<double>(std::chrono::steady_clock::now() - __tA0).count();
+      g_mfProfile.numFronts++;
+      g_mfProfile.sumFrontSize += m;
+      g_mfProfile.sumFrontSizeSq += (long long)m * m;
+      g_mfProfile.sumEligTimesMsq += (double)nEligible * (double)m * (double)m;
+      if (m > g_mfProfile.maxFrontSize) { g_mfProfile.maxFrontSize = m; g_mfProfile.maxFrontNEligible = nEligible; }
+      auto __tB0 = std::chrono::steady_clock::now();
+#endif
+
       MatrixX F = MatrixX::Zero(m, m);
 
       // --- Extend: A's own contribution to this supernode's own columns. ---
@@ -277,6 +311,10 @@ class MultifrontalFactorizer {
         }
       }
 
+#ifdef SYMLA_PROFILE
+      g_mfProfile.extendSec += std::chrono::duration<double>(std::chrono::steady_clock::now() - __tB0).count();
+      auto __tC0 = std::chrono::steady_clock::now();
+#endif
       // --- Add: each child's generated element, extend-add via the O(1)
       // scratch-array index map (never an O(m^2) search). ---
       for (int ci : childrenSN[si]) {
@@ -300,9 +338,16 @@ class MultifrontalFactorizer {
 
       for (int t = 0; t < m; ++t) globalToLocal[frontIdx[t]] = -1;  // reset scratch
 
+#ifdef SYMLA_PROFILE
+      g_mfProfile.addSec += std::chrono::duration<double>(std::chrono::steady_clock::now() - __tC0).count();
+      auto __tD0 = std::chrono::steady_clock::now();
+#endif
       // --- Factor, restricted to the eligible (fully-summed) block. ---
       MatrixX D;
       DenseLDLTResult res = DenseLDLT<Scalar>::factor(F, D, options, nEligible);
+#ifdef SYMLA_PROFILE
+      g_mfProfile.factorSec += std::chrono::duration<double>(std::chrono::steady_clock::now() - __tD0).count();
+#endif
 
       nf.inertia.n_pos += res.inertia.n_pos;
       nf.inertia.n_neg += res.inertia.n_neg;

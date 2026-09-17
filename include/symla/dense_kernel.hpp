@@ -178,6 +178,74 @@ class DenseLDLT {
     if (orig_max < options.zero_tolerance) orig_max = 1.0;  // avoid div-by-zero on the all-zero matrix
     double running_max = orig_max;
 
+    // After each rank-1/rank-2 trailing update below, both triangles of the
+    // (potentially huge) trailing block are re-averaged for exact symmetric
+    // consistency: `A(i,j) = A(j,i) = 0.5*(A(i,j)+A(j,i))`. A previous
+    // version of this code did this via a single Eigen expression,
+    // `A = ((A + A.transpose()) * 0.5).eval()`, which forces Eigen to
+    // evaluate a transposed read of a large non-contiguous `Block` of a
+    // column-major matrix -- extremely cache-hostile (each "row" of the
+    // transpose read strides across the whole matrix's leading dimension)
+    // -- profiling on a 2745x2745 front found that single operation
+    // responsible for ~40 of ~45 total seconds of factor() time.
+    //
+    // Two cheaper alternatives were tried and rejected before this one:
+    //   - Deleting the re-symmetrization entirely (relying on the rank-1/
+    //     rank-2 update already being "close enough" to symmetric):
+    //     measurably worsened real-matrix residuals (e.g. GHS_indef/sit100
+    //     went from ~0.031 to ~0.35 against a 0.05 test bound) -- on
+    //     borderline ill-conditioned inputs, which of two mathematically
+    //     equal but last-bit-different roundings ends up stored evidently
+    //     does affect downstream Bunch-Kaufman tie-breaking enough to
+    //     matter, and simply averaging the two, as the original code did,
+    //     measurably helps.
+    //   - Only re-symmetrizing the small "eligible" (not-yet-pivoted,
+    //     fully-summed) leading corner rather than the whole trailing
+    //     block, on the reasoning that pivot search never reads outside
+    //     that corner: also measurably worsened residuals, because the
+    //     *averaged* value (not just a consistently-mirrored one) in the
+    //     larger "ancestor" region is exactly what gets forwarded to the
+    //     parent front as this front's generated element / Schur
+    //     complement, so skipping the averaging there changes the numeric
+    //     values a later front's pivot search *does* see, even though this
+    //     front's own search never touches that region.
+    // What actually works: the exact same "average both triangles" formula
+    // as the original, just computed via an explicit cache-blocked
+    // (tile-at-a-time) loop instead of Eigen's whole-block transpose
+    // expression, so both the read and write working sets stay
+    // cache-resident. This is bit-identical to the original (same formula,
+    // same operands, order-independent per entry) and, on the same
+    // 2745x2745 front, roughly 5-6x faster than the original single-shot
+    // expression.
+    auto resymmetrizeTrailing = [&](auto trailingBlock) {
+      const int extent = static_cast<int>(trailingBlock.rows());
+      if (extent == 0) return;
+      constexpr int kTile = 64;
+      for (int jb = 0; jb < extent; jb += kTile) {
+        const int jn = std::min(kTile, extent - jb);
+        for (int ib = jb; ib < extent; ib += kTile) {
+          const int in = std::min(kTile, extent - ib);
+          if (ib == jb) {
+            for (int j = jb; j < jb + jn; ++j) {
+              for (int i = j + 1; i < jb + jn; ++i) {
+                const double avg = 0.5 * (trailingBlock(i, j) + trailingBlock(j, i));
+                trailingBlock(i, j) = avg;
+                trailingBlock(j, i) = avg;
+              }
+            }
+          } else {
+            for (int j = jb; j < jb + jn; ++j) {
+              for (int i = ib; i < ib + in; ++i) {
+                const double avg = 0.5 * (trailingBlock(i, j) + trailingBlock(j, i));
+                trailingBlock(i, j) = avg;
+                trailingBlock(j, i) = avg;
+              }
+            }
+          }
+        }
+      }
+    };
+
     auto swap_rowcol = [&](int i, int j) {
       if (i == j) return;
       A.row(i).swap(A.row(j));
@@ -281,8 +349,7 @@ class DenseLDLT {
           // A(i,j) -= l(i) * d * l(j)  for i,j in (k, n)
           auto trailing = A.block(k + 1, k + 1, m - 1, m - 1);
           trailing.noalias() -= (d * l) * l.transpose();
-          // keep exact symmetry (avoid drift from floating point order of ops)
-          trailing = ((trailing + trailing.transpose()) * 0.5).eval();
+          resymmetrizeTrailing(trailing);
           A.col(k).segment(k + 1, m - 1) = l;
           A.row(k).segment(k + 1, m - 1) = l.transpose();
           running_max = std::max(running_max, trailing.cwiseAbs().maxCoeff());
@@ -309,7 +376,7 @@ class DenseLDLT {
           running_max = std::max(running_max, A.block(k + 1, k, m - 1, 1).cwiseAbs().maxCoeff());
           auto trailing = A.block(k + 1, k + 1, m - 1, m - 1);
           trailing.noalias() -= (d * l) * l.transpose();
-          trailing = ((trailing + trailing.transpose()) * 0.5).eval();
+          resymmetrizeTrailing(trailing);
           A.col(k).segment(k + 1, m - 1) = l;
           A.row(k).segment(k + 1, m - 1) = l.transpose();
           running_max = std::max(running_max, trailing.cwiseAbs().maxCoeff());
@@ -383,7 +450,7 @@ class DenseLDLT {
           D2 << d11, d21, d21, d22;
           auto trailing = A.block(k + 2, k + 2, mm, mm);
           trailing.noalias() -= L2 * D2 * L2.transpose();
-          trailing = ((trailing + trailing.transpose()) * 0.5).eval();
+          resymmetrizeTrailing(trailing);
 
           A.block(k + 2, k, mm, 2) = L2;
           A.block(k, k + 2, 2, mm) = L2.transpose();

@@ -1,0 +1,8 @@
+build/
+build-*/
+bench/matrices/
+*.o
+*.obj
+compile_commands.json
+.cache/
+.claude/

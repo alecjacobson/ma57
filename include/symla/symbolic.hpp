@@ -23,23 +23,45 @@
 //      row patterns actually match (Struct(L*j)\{j} == Struct(L*(j+1))), so
 //      the block can be stored as one exact dense trapezoid with zero extra
 //      fill.
-//   6. relaxed amalgamation: walk the (index-contiguous, by construction)
-//      list of fundamental supernodes and merge supernode k into an
-//      in-progress group with supernode k+1 when they are connected by an
-//      etree parent-child edge (tree.parent[last col of k] == firstCol of
-//      k+1) *and* the merge satisfies both a size cap (`max_relax_size`,
-//      default 64 columns) and a relative "extra fill" cap
-//      (`max_relax_fill_fraction`, default 0.25 of the merged block's dense
-//      storage). This is a simplified version of Ashcraft-Grimes: the full
-//      scheme in the literature also merges parent/child supernodes that are
-//      *not* index-adjacent (absorbing a "gap" of intervening unrelated
-//      columns as extra logical fill in the stored block); we deliberately
-//      only merge index-adjacent etree-connected pairs, which keeps the
-//      dense-trapezoid storage model exact and the implementation simple,
-//      and covers the common/most impactful case (the last-visited child of
-//      a node in postorder is always index-adjacent to its parent). This is
-//      a documented scope reduction for Phase 1 -- revisit if profiling
-//      shows non-adjacent merges matter.
+//   6. relaxed amalgamation, general (non-adjacent) Ashcraft-Grimes form:
+//      build the *supernode tree* over fundamental supernodes (supernode i's
+//      parent is the fundamental supernode containing etree.parent[i's last
+//      column]) and, processing fundamental supernodes in increasing index
+//      order (a valid bottom-up/postorder traversal of that tree, since
+//      etree.parent[j] > j always), try absorbing *every* child of the
+//      current node into it -- not just an index-adjacent one -- subject to
+//      a size cap (`max_relax_size`, default 64 columns) and a relative
+//      "extra fill" cap (`max_relax_fill_fraction`, default 0.25 of the
+//      merged block's dense storage), same criteria as before but evaluated
+//      against the *general* supernode-tree parent/child relation via a
+//      union-find over merge groups. This fixes a real defect in the
+//      earlier index-adjacent-only scheme: under postorder, only the
+//      *last-visited* child of a node ends up index-adjacent to it (postorder
+//      places a node's last child immediately before the node itself); every
+//      other child is separated from the parent by other subtrees'
+//      columns. On branchy etrees (typical of 3D PDE stencils/meshes) this
+//      meant almost no merging ever fired, since only one child per parent
+//      was ever eligible. General (index-independent) merging fixes this,
+//      but merged groups are no longer contiguous in the postorder used to
+//      build the tree, so after merge decisions are made we perform a
+//      *second* relabeling pass (mirroring step 3's postorder-for-
+//      contiguity trick, applied here to the coarser *merge-group* forest
+//      instead of the raw etree): each merge group is emitted as a
+//      contiguous block of columns (its own columns last, preceded by its
+//      absorbed children's columns in their own already-valid internal
+//      order), and merge groups themselves are emitted in a postorder of
+//      the merge-group forest, giving a new global permutation under which
+//      every final supernode's columns are contiguous (preserving the
+//      "first ncols entries of rowPattern are the supernode's own
+//      contiguous columns" invariant multifrontal.hpp depends on). The
+//      pattern/etree/column-counts are then rebuilt once more on this final
+//      permutation (this is exact, not a heuristic: any postorder of a
+//      fixed etree yields identical fill, Liu 1990, so the fill-fraction
+//      decisions made against the pre-relabeling patterns are consistent
+//      with what the rebuilt tree will show), and each final supernode's
+//      stored row pattern is computed as the union of its member columns'
+//      Struct(L*c) in the final index space (safe and general -- doesn't
+//      rely on the nesting property fundamental supernodes get for free).
 
 #include "symla/elimination_tree.hpp"
 #include "symla/ordering.hpp"
@@ -138,6 +160,26 @@ struct Supernode {
 
 struct SymbolicFactorOptions {
   int max_relax_size = 64;
+  // Kept at the Phase 1 default (0.25), *not* raised, despite evidence it
+  // is conservative for some matrices -- see the long comment block above
+  // for the measured tradeoff data. Measured on GHS_indef/bratu3d (a
+  // genuinely 3D PDE problem, n=27792): raising this to 0.5 does improve
+  // the average supernode size a lot (1.65 -> 25.7 cols, at a 1.32x vs
+  // 1.05x storage-nnz cost) but was also observed to make `factorize()`
+  // *slower* in wall-clock terms on this specific matrix (>700s vs 314.9s
+  // at 0.25, both single-threaded) -- plausibly because the general
+  // (non-nested-branch) merges introduce genuine "logical fill" zero
+  // entries into a front's dense block, and on an already-hard indefinite
+  // problem like bratu3d (which already has ~21% of columns needing
+  // delayed pivoting even at 0.25) more of those structural zeros inside
+  // bigger blocks may be triggering more delayed-pivot cascades that
+  // inflate ancestor front sizes further up the tree, offsetting the
+  // BLAS-3 blocking win. This was not fully root-caused (see the Phase
+  // 1.1 report / Phase 6 handoff notes) so the default is left
+  // unchanged; callers whose matrices are known to behave well under more
+  // aggressive amalgamation (most non-pathological cases: stokes128,
+  // aug3dcqp, helm2d03 all improve markedly here with no timing
+  // regression observed) can raise `max_relax_fill_fraction` explicitly.
   double max_relax_fill_fraction = 0.25;
 };
 
@@ -184,60 +226,174 @@ struct SymbolicFactor {
     sf.etree = tree;
 
     // --- Step 5: fundamental supernodes. ---
-    std::vector<Supernode> funda;
-    int j = 0;
-    while (j < n) {
-      const int start = j;
-      while (j + 1 < n && tree.parent[j] == j + 1 && tree.colCount[j] == tree.colCount[j + 1] + 1) {
+    auto computeFundamentalSupernodes = [](const EliminationTree& t,
+                                            const std::vector<std::vector<int>>& patterns) {
+      std::vector<Supernode> out;
+      const int nn = t.n;
+      int j = 0;
+      while (j < nn) {
+        const int start = j;
+        while (j + 1 < nn && t.parent[j] == j + 1 && t.colCount[j] == t.colCount[j + 1] + 1) {
+          ++j;
+        }
+        Supernode sn;
+        sn.firstCol = start;
+        sn.ncols = j - start + 1;
+        sn.rowPattern = patterns[start];
+        out.push_back(std::move(sn));
         ++j;
       }
+      return out;
+    };
+
+    std::vector<Supernode> funda = computeFundamentalSupernodes(tree, rowPatterns);
+    const int numFunda = static_cast<int>(funda.size());
+
+    // --- Step 6a: build the supernode tree over fundamental supernodes. ---
+    std::vector<int> colToFunda(n, -1);
+    for (int i = 0; i < numFunda; ++i) {
+      for (int c = funda[i].firstCol; c < funda[i].firstCol + funda[i].ncols; ++c) colToFunda[c] = i;
+    }
+    std::vector<int> parentFunda(numFunda, -1);
+    std::vector<std::vector<int>> childrenFunda(numFunda);
+    for (int i = 0; i < numFunda; ++i) {
+      const int lastCol = funda[i].firstCol + funda[i].ncols - 1;
+      const int p = tree.parent[lastCol];
+      if (p != -1) {
+        const int pf = colToFunda[p];
+        parentFunda[i] = pf;
+        childrenFunda[pf].push_back(i);
+      }
+    }
+
+    // --- Step 6b: general relaxed amalgamation via union-find over the
+    // supernode tree, processing fundamental supernodes bottom-up
+    // (increasing index is a valid postorder of this tree: parentFunda[i]
+    // is always > i, since it derives from tree.parent[lastCol] > lastCol
+    // >= i). For each node, try absorbing *every* child (not just an
+    // index-adjacent one) subject to the size/fill caps. ---
+    std::vector<int> dsu(numFunda);
+    for (int i = 0; i < numFunda; ++i) dsu[i] = i;
+    auto find = [&](int x) {
+      while (dsu[x] != x) {
+        dsu[x] = dsu[dsu[x]];
+        x = dsu[x];
+      }
+      return x;
+    };
+
+    struct Agg {
+      int ncols = 0;
+      std::vector<int> rowPattern;  // stage-1 (pre-relabel) index space; merge decisions only
+      std::vector<int> segments;    // ordered list of fundamental-supernode indices, own last
+    };
+    std::vector<Agg> agg(numFunda);
+    for (int i = 0; i < numFunda; ++i) {
+      agg[i].ncols = funda[i].ncols;
+      agg[i].rowPattern = funda[i].rowPattern;
+      agg[i].segments = {i};
+    }
+
+    auto storageNnzOf = [](int ncols, std::size_t m) -> std::int64_t {
+      const std::int64_t k = ncols;
+      const std::int64_t mm = static_cast<std::int64_t>(m);
+      return k * mm - k * (k - 1) / 2;
+    };
+
+    for (int i = 0; i < numFunda; ++i) {
+      for (int c : childrenFunda[i]) {
+        const int cr = find(c);
+        if (cr == i) continue;
+        const int mergedNcols = agg[i].ncols + agg[cr].ncols;
+        if (mergedNcols > options.max_relax_size) continue;
+
+        std::vector<int> mergedPattern;
+        mergedPattern.reserve(agg[i].rowPattern.size() + agg[cr].rowPattern.size());
+        std::set_union(agg[i].rowPattern.begin(), agg[i].rowPattern.end(), agg[cr].rowPattern.begin(),
+                        agg[cr].rowPattern.end(), std::back_inserter(mergedPattern));
+
+        const std::int64_t mergedStorage = storageNnzOf(mergedNcols, mergedPattern.size());
+        const std::int64_t origStorage = storageNnzOf(agg[i].ncols, agg[i].rowPattern.size()) +
+                                          storageNnzOf(agg[cr].ncols, agg[cr].rowPattern.size());
+        const double extraFrac =
+            static_cast<double>(mergedStorage - origStorage) / static_cast<double>(mergedStorage);
+        if (extraFrac > options.max_relax_fill_fraction) continue;
+
+        // Accept: absorb cr's group into i's group. cr's (already validly
+        // ordered) segments go before i's own trailing "own" entry.
+        dsu[cr] = i;
+        agg[i].ncols = mergedNcols;
+        agg[i].rowPattern = std::move(mergedPattern);
+        agg[i].segments.insert(agg[i].segments.end() - 1, agg[cr].segments.begin(), agg[cr].segments.end());
+      }
+    }
+
+    // --- Step 6c: final merge groups = union-find roots. Build the
+    // (coarser) merge-group forest and take its postorder, so groups are
+    // emitted with descendants before ancestors -- required for the
+    // relabeling below to remain a valid elimination order. ---
+    std::vector<int> finalRoots;
+    for (int i = 0; i < numFunda; ++i) {
+      if (find(i) == i) finalRoots.push_back(i);
+    }
+    const int numFinal = static_cast<int>(finalRoots.size());
+    std::vector<int> compactOf(numFunda, -1);
+    for (int k = 0; k < numFinal; ++k) compactOf[finalRoots[k]] = k;
+
+    Eigen::VectorXi finalParentCompact(numFinal);
+    for (int k = 0; k < numFinal; ++k) {
+      const int r = finalRoots[k];
+      const int pf = parentFunda[r];
+      finalParentCompact[k] = (pf == -1) ? -1 : compactOf[find(pf)];
+    }
+    std::vector<int> groupPostorder = detail::postorder(finalParentCompact);
+
+    // --- Step 6d: emit the new column relabeling + provisional supernode
+    // boundaries (firstCol/ncols) in this group postorder. ---
+    std::vector<Supernode> finalSupernodes;
+    finalSupernodes.reserve(numFinal);
+    std::vector<int> newOrder;  // stage-1 index space, size n
+    newOrder.reserve(n);
+    for (int gk : groupPostorder) {
+      const int r = finalRoots[gk];
       Supernode sn;
-      sn.firstCol = start;
-      sn.ncols = j - start + 1;
-      sn.rowPattern = rowPatterns[start];
-      funda.push_back(std::move(sn));
-      ++j;
-    }
-    sf.fundamentalSupernodes = funda;
-
-    // --- Step 6: relaxed amalgamation over the (index-contiguous) list of
-    // fundamental supernodes. ---
-    std::vector<Supernode> result;
-    Supernode cur = funda[0];
-    for (std::size_t k = 1; k < funda.size(); ++k) {
-      const Supernode& next = funda[k];
-      const bool etreeAdjacent = (tree.parent[cur.firstCol + cur.ncols - 1] == next.firstCol);
-      bool merged = false;
-      if (etreeAdjacent) {
-        const int mergedNcols = cur.ncols + next.ncols;
-        if (mergedNcols <= options.max_relax_size) {
-          std::vector<int> mergedPattern;
-          mergedPattern.reserve(cur.rowPattern.size() + next.rowPattern.size());
-          std::set_union(cur.rowPattern.begin(), cur.rowPattern.end(), next.rowPattern.begin(),
-                          next.rowPattern.end(), std::back_inserter(mergedPattern));
-
-          Supernode mergedSn;
-          mergedSn.firstCol = cur.firstCol;
-          mergedSn.ncols = mergedNcols;
-          mergedSn.rowPattern = mergedPattern;
-
-          const std::int64_t mergedStorage = mergedSn.storageNnz();
-          const std::int64_t origStorage = cur.storageNnz() + next.storageNnz();
-          const double extraFrac =
-              static_cast<double>(mergedStorage - origStorage) / static_cast<double>(mergedStorage);
-          if (extraFrac <= options.max_relax_fill_fraction) {
-            cur = std::move(mergedSn);
-            merged = true;
-          }
-        }
+      sn.firstCol = static_cast<int>(newOrder.size());
+      sn.ncols = agg[r].ncols;
+      for (int fi : agg[r].segments) {
+        for (int c = funda[fi].firstCol; c < funda[fi].firstCol + funda[fi].ncols; ++c) newOrder.push_back(c);
       }
-      if (!merged) {
-        result.push_back(std::move(cur));
-        cur = next;
-      }
+      finalSupernodes.push_back(std::move(sn));
     }
-    result.push_back(std::move(cur));
-    sf.supernodes = std::move(result);
+
+    // --- Step 6e: compose the relabeling into the final permutation and
+    // rebuild the pattern/etree/column-counts on it (exact, not heuristic:
+    // newOrder is a valid postorder of the same etree, so fill is
+    // unchanged -- see the header comment). ---
+    Eigen::VectorXi combinedPerm(n);
+    for (int k = 0; k < n; ++k) combinedPerm[k] = finalPerm[newOrder[k]];
+
+    Eigen::SparseMatrix<double, Eigen::ColMajor, int> Afinal2 = detail::permutePatternSymmetric(A, combinedPerm);
+    std::vector<std::vector<int>> rowPatterns2;
+    EliminationTree tree2 = EliminationTree::build(Afinal2, &rowPatterns2);
+
+    sf.perm = combinedPerm;
+    sf.etree = tree2;
+    sf.fundamentalSupernodes = computeFundamentalSupernodes(tree2, rowPatterns2);
+
+    // --- Step 6f: fill in each final supernode's row pattern as the union
+    // of its member columns' Struct(L*c) in the final index space. ---
+    for (auto& sn : finalSupernodes) {
+      std::vector<int> pattern;
+      for (int c = sn.firstCol; c < sn.firstCol + sn.ncols; ++c) {
+        std::vector<int> merged;
+        merged.reserve(pattern.size() + rowPatterns2[c].size());
+        std::set_union(pattern.begin(), pattern.end(), rowPatterns2[c].begin(), rowPatterns2[c].end(),
+                        std::back_inserter(merged));
+        pattern.swap(merged);
+      }
+      sn.rowPattern = std::move(pattern);
+    }
+    sf.supernodes = std::move(finalSupernodes);
 
     return sf;
   }

@@ -32,8 +32,12 @@ class SymLDLT {
   void setOrdering(OrderingType ordering) { ordering_ = ordering; }
 
   // Analyze sparsity pattern only (ordering + symbolic factorization).
-  void analyzePattern(const SparseMatrix& A) {
-    symbolic_ = SymbolicFactor::analyze(A, ordering_);
+  // `options` controls the relaxed-amalgamation caps (symbolic.hpp); the
+  // default reproduces the library's standard behavior, an explicit value
+  // is mainly useful for tests that want to pin down a specific supernode
+  // partition (e.g. disabling amalgamation with max_relax_size = 1).
+  void analyzePattern(const SparseMatrix& A, const SymbolicFactorOptions& options = SymbolicFactorOptions()) {
+    symbolic_ = SymbolicFactor::analyze(A, ordering_, options);
     pattern_analyzed_ = true;
     factorized_ = false;
   }

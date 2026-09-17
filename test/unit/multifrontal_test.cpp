@@ -11,6 +11,7 @@
 using Sparse = Eigen::SparseMatrix<double, Eigen::ColMajor, int>;
 using symla::OrderingType;
 using symla::SymbolicFactor;
+using symla::SymbolicFactorOptions;
 using symla::SymLDLT;
 
 namespace {
@@ -115,7 +116,17 @@ void testDelayedPivotArrow() {
   Sparse S = fromDense(A);
   SymLDLT<double> solver;
   solver.setOrdering(OrderingType::Natural);  // keep the hand-analyzed arrow etree shape
-  solver.analyzePattern(S);
+  // Phase 1.1 correction: relaxed amalgamation now merges parent/child
+  // supernodes generally (not just index-adjacent ones, see symbolic.hpp),
+  // so with default options both leaves 0 and 1 would merge into the hub
+  // supernode (they're both direct etree children of it), collapsing this
+  // test's three-front "delayed pivot forwarded to an ancestor front"
+  // scenario into a single front. Disable amalgamation explicitly
+  // (max_relax_size = 1) to keep testing that specific mechanism.
+  SymbolicFactorOptions noAmalgamation;
+  noAmalgamation.max_relax_size = 1;
+  noAmalgamation.max_relax_fill_fraction = 0.0;
+  solver.analyzePattern(S, noAmalgamation);
 
   const SymbolicFactor& sf = solver.symbolicFactor();
   // Sanity-check the assumed supernode shape before trusting the rest of

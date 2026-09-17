@@ -91,3 +91,11 @@ add_executable(symla_scaling_regression_test stability/scaling_regression_test.c
 target_link_libraries(symla_scaling_regression_test PRIVATE symla::symla)
 target_include_directories(symla_scaling_regression_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/unit)
 add_test(NAME scaling_regression_test COMMAND symla_scaling_regression_test)
+
+# Phase 1.1 regression guard: relaxed amalgamation must actually amalgamate
+# on real, branchy matrices (see the file's header comment for root cause).
+# Skips gracefully if bench/matrices/ hasn't been populated.
+add_executable(symla_supernode_amalgamation_regression_test stability/supernode_amalgamation_regression_test.cpp)
+target_link_libraries(symla_supernode_amalgamation_regression_test PRIVATE symla::symla)
+target_include_directories(symla_supernode_amalgamation_regression_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/unit)
+add_test(NAME supernode_amalgamation_regression_test COMMAND symla_supernode_amalgamation_regression_test)

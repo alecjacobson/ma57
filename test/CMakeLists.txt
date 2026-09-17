@@ -99,3 +99,29 @@ add_executable(symla_supernode_amalgamation_regression_test stability/supernode_
 target_link_libraries(symla_supernode_amalgamation_regression_test PRIVATE symla::symla)
 target_include_directories(symla_supernode_amalgamation_regression_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/unit)
 add_test(NAME supernode_amalgamation_regression_test COMMAND symla_supernode_amalgamation_regression_test)
+
+# --- Phase 6: task-DAG parallelism (concurrency correctness) ---
+
+add_executable(symla_thread_equivalence_test concurrency/thread_equivalence_test.cpp)
+target_link_libraries(symla_thread_equivalence_test PRIVATE symla::symla)
+target_include_directories(symla_thread_equivalence_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/unit)
+add_test(NAME thread_equivalence_test COMMAND symla_thread_equivalence_test)
+
+add_executable(symla_repeated_run_determinism_test concurrency/repeated_run_determinism_test.cpp)
+target_link_libraries(symla_repeated_run_determinism_test PRIVATE symla::symla)
+target_include_directories(symla_repeated_run_determinism_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/unit)
+add_test(NAME repeated_run_determinism_test COMMAND symla_repeated_run_determinism_test)
+
+# Optional ThreadSanitizer build of a small-but-nontrivial parallel
+# factorize+solve case, gated behind its own option so it doesn't slow down
+# or complicate the default build/test (TSan instrumentation is slow and
+# incompatible with mixing into the same binary as the rest of the suite).
+option(SYMLA_WITH_TSAN_TEST "Build a ThreadSanitizer-instrumented concurrency smoke test" OFF)
+if(SYMLA_WITH_TSAN_TEST)
+  add_executable(symla_tsan_concurrency_test concurrency/tsan_concurrency_test.cpp)
+  target_link_libraries(symla_tsan_concurrency_test PRIVATE symla::symla)
+  target_include_directories(symla_tsan_concurrency_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/unit)
+  target_compile_options(symla_tsan_concurrency_test PRIVATE -fsanitize=thread -g -O1)
+  target_link_options(symla_tsan_concurrency_test PRIVATE -fsanitize=thread)
+  add_test(NAME tsan_concurrency_test COMMAND symla_tsan_concurrency_test)
+endif()

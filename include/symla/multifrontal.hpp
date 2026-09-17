@@ -39,13 +39,19 @@
 // solve (Phase 4).
 
 #include "symla/dense_kernel.hpp"
+#include "symla/parallel/task_graph.hpp"
 #include "symla/solver.hpp"
 #include "symla/symbolic.hpp"
 
 #include <Eigen/Sparse>
 
 #include <algorithm>
+#include <mutex>
 #include <vector>
+
+#ifdef SYMLA_HAVE_OPENMP
+#include <omp.h>
+#endif
 
 #ifdef SYMLA_PROFILE
 #include <chrono>
@@ -128,7 +134,17 @@ struct SupernodeFactor {
 // parent has strictly larger final-order index than every pivot finalized
 // at any of its descendants, by construction of the elimination tree).
 struct NumericFactor {
-  std::vector<SupernodeFactor> fronts;  // in processing order
+  std::vector<SupernodeFactor> fronts;  // fronts[si] == the front for supernode si; since
+                                         // symbolic.hpp's postorder-by-construction numbering
+                                         // already makes supernode-index order a valid
+                                         // processing order (see header comment above),
+                                         // "indexed by supernode index" and "in processing
+                                         // order" are the same statement, both under the
+                                         // Phase 3 serial driver and the Phase 6 parallel one
+                                         // below (each front is written to its own
+                                         // predetermined slot `fronts[si]`, never appended, so
+                                         // out-of-order parallel completion does not disturb
+                                         // this ordering).
   Eigen::VectorXi perm;                 // copy of SymbolicFactor::perm (final-order -> original index)
   Inertia inertia;
   bool singular = false;
@@ -196,6 +212,26 @@ struct PermutedLower {
 
 }  // namespace detail
 
+// Phase 6: options controlling task-DAG parallel execution of `factorize()`
+// over the supernode tree. See parallel/task_graph.hpp for the scheduling
+// primitive this drives.
+struct MultifrontalOptions {
+  // If false (or if SYMLA_HAVE_OPENMP is not defined), factorize() runs the
+  // exact same single-threaded postorder loop Phase 3 always has.
+  bool parallel = false;
+
+  // 0 means "use whatever `omp_get_max_threads()` / OMP_NUM_THREADS
+  // currently reports"; a positive value pins the parallel region to that
+  // many threads for this call via `omp_set_num_threads()`.
+  int num_threads = 0;
+
+  // Subtree-size (in supernodes) below which a child subtree is executed
+  // inline by the same thread rather than spawned as a separate OpenMP
+  // task -- avoids task-creation overhead dominating for the very common
+  // case of many tiny leaf supernodes. See parallel::runTaskDag.
+  long long task_cutoff = 8;
+};
+
 template <typename Scalar>
 class MultifrontalFactorizer {
  public:
@@ -203,7 +239,7 @@ class MultifrontalFactorizer {
   using SparseMatrix = Eigen::SparseMatrix<Scalar, Eigen::ColMajor, int>;
 
   static NumericFactor factorize(const SymbolicFactor& sf, const SparseMatrix& A,
-                                  const DenseLDLTOptions& options = {}) {
+                                  const DenseLDLTOptions& options = {}, const MultifrontalOptions& mfOptions = {}) {
     const int n = sf.etree.n;
     NumericFactor nf;
     nf.perm = sf.perm;
@@ -222,6 +258,7 @@ class MultifrontalFactorizer {
     }
     std::vector<int> parentSN(numSN, -1);
     std::vector<std::vector<int>> childrenSN(numSN);
+    std::vector<int> rootsSN;
     for (int si = 0; si < numSN; ++si) {
       const auto& sn = supernodes[si];
       const int lastCol = sn.firstCol + sn.ncols - 1;
@@ -232,6 +269,9 @@ class MultifrontalFactorizer {
         childrenSN[psn].push_back(si);
       }
     }
+    for (int si = 0; si < numSN; ++si) {
+      if (parentSN[si] == -1) rootsSN.push_back(si);
+    }
 
     // --- Numeric values of A, permuted into final order, lower triangle only. ---
     auto Aperm = detail::PermutedLower<Scalar, SparseMatrix>::build(A, sf.perm);
@@ -239,18 +279,78 @@ class MultifrontalFactorizer {
     // Generated element ("update matrix") produced by each supernode after
     // its own processing, consumed exactly once by its parent (freed
     // thereafter). Indexed by supernode index; empty/unused entries (roots
-    // with nothing left over) simply never get read.
+    // with nothing left over) simply never get read. Under the Phase 6
+    // parallel driver this is still race-free without any locking: slot
+    // `si` is written exactly once, by the single task that processes
+    // supernode `si`, and is only ever read by supernode `si`'s parent --
+    // which the task-DAG scheduler (parallel/task_graph.hpp) guarantees
+    // cannot start until an `#pragma omp taskwait` has joined every child
+    // task, establishing the happens-before edge this relies on.
     struct GeneratedElement {
       std::vector<int> indices;  // final-order indices, size p
       MatrixX matrix;            // p x p, lower triangle valid (Schur complement)
     };
     std::vector<GeneratedElement> genElem(numSN);
 
-    std::vector<int> globalToLocal(n, -1);  // scratch, reset after each front
+    // Phase 6: `fronts` is pre-sized and each supernode writes only to its
+    // own slot `fronts[si]` -- safe for concurrent out-of-order completion
+    // without locking (see the NumericFactor::fronts comment above; this is
+    // exactly the "pre-sized vector, indexed writes" pattern the Phase 6
+    // plan calls for, replacing the old push_back-in-postorder-only
+    // approach, which relied on the loop's strict sequential order and
+    // would race under concurrent completion).
+    nf.fronts.resize(numSN);
 
-    nf.fronts.reserve(numSN);
+    // Per-front inertia contributions and a `singular` critical section:
+    // avoids a shared `nf.inertia +=` (a real data race under parallel
+    // execution) by having each task write only its own slot, then summing
+    // serially once all fronts are done; `nf.singular`/`nf.singularCols`
+    // are written extremely rarely (only for a genuinely rank-deficient
+    // root) so a plain mutex is sufficient and never contended in the
+    // common case.
+    std::vector<Inertia> perFrontInertia(numSN);
+    std::mutex singularMutex;
 
+    // Phase 6: `globalToLocal` used to be a single array shared across the
+    // whole (strictly sequential) loop; under task parallelism, concurrent
+    // fronts must not stomp on each other's scratch space, so this becomes
+    // one buffer per *thread* (not per front -- reused across all fronts a
+    // given thread processes, exactly like the old single shared buffer
+    // was reused across all fronts in the serial driver, just now one per
+    // worker instead of one globally). Every use below touches only the
+    // entries it just set (and resets exactly those before returning), so
+    // reuse across fronts on the same thread is safe.
+#ifdef SYMLA_HAVE_OPENMP
+    const int maxThreads = mfOptions.parallel ? std::max(1, mfOptions.num_threads > 0 ? mfOptions.num_threads
+                                                                                       : omp_get_max_threads())
+                                               : 1;
+#else
+    const int maxThreads = 1;
+#endif
+    std::vector<std::vector<int>> globalToLocalTls(maxThreads, std::vector<int>(n, -1));
+
+    // Subtree weight (in supernodes) for the task-spawn-vs-inline cutoff
+    // heuristic; increasing-si order is already a valid postorder (see the
+    // header comment), so a single forward pass suffices.
+    std::vector<long long> subtreeWeight(numSN, 1);
     for (int si = 0; si < numSN; ++si) {
+      const int p = parentSN[si];
+      if (p != -1) subtreeWeight[p] += subtreeWeight[si];
+    }
+
+    // --- The actual per-supernode work: extend-add assembly from children's
+    // generated elements + A's own contribution, dense LDL^T factorization
+    // restricted to the eligible columns, and forwarding the remainder to
+    // the parent (or flagging singularity at a root). Identical math to the
+    // Phase 3 driver; only the surrounding scheduling changed. ---
+    auto processSupernode = [&](int si) {
+#ifdef SYMLA_HAVE_OPENMP
+      const int tid = mfOptions.parallel ? omp_get_thread_num() : 0;
+#else
+      const int tid = 0;
+#endif
+      std::vector<int>& globalToLocal = globalToLocalTls[tid];
+
       const auto& sn = supernodes[si];
       const int ncols = sn.ncols;
 
@@ -289,12 +389,19 @@ class MultifrontalFactorizer {
       for (int t = 0; t < m; ++t) globalToLocal[frontIdx[t]] = t;
 
 #ifdef SYMLA_PROFILE
-      g_mfProfile.extraFromChildrenSec += std::chrono::duration<double>(std::chrono::steady_clock::now() - __tA0).count();
-      g_mfProfile.numFronts++;
-      g_mfProfile.sumFrontSize += m;
-      g_mfProfile.sumFrontSizeSq += (long long)m * m;
-      g_mfProfile.sumEligTimesMsq += (double)nEligible * (double)m * (double)m;
-      if (m > g_mfProfile.maxFrontSize) { g_mfProfile.maxFrontSize = m; g_mfProfile.maxFrontNEligible = nEligible; }
+#pragma omp critical(symla_mf_profile)
+      {
+        g_mfProfile.extraFromChildrenSec +=
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - __tA0).count();
+        g_mfProfile.numFronts++;
+        g_mfProfile.sumFrontSize += m;
+        g_mfProfile.sumFrontSizeSq += (long long)m * m;
+        g_mfProfile.sumEligTimesMsq += (double)nEligible * (double)m * (double)m;
+        if (m > g_mfProfile.maxFrontSize) {
+          g_mfProfile.maxFrontSize = m;
+          g_mfProfile.maxFrontNEligible = nEligible;
+        }
+      }
       auto __tB0 = std::chrono::steady_clock::now();
 #endif
 
@@ -312,7 +419,8 @@ class MultifrontalFactorizer {
       }
 
 #ifdef SYMLA_PROFILE
-      g_mfProfile.extendSec += std::chrono::duration<double>(std::chrono::steady_clock::now() - __tB0).count();
+#pragma omp critical(symla_mf_profile)
+      { g_mfProfile.extendSec += std::chrono::duration<double>(std::chrono::steady_clock::now() - __tB0).count(); }
       auto __tC0 = std::chrono::steady_clock::now();
 #endif
       // --- Add: each child's generated element, extend-add via the O(1)
@@ -339,19 +447,19 @@ class MultifrontalFactorizer {
       for (int t = 0; t < m; ++t) globalToLocal[frontIdx[t]] = -1;  // reset scratch
 
 #ifdef SYMLA_PROFILE
-      g_mfProfile.addSec += std::chrono::duration<double>(std::chrono::steady_clock::now() - __tC0).count();
+#pragma omp critical(symla_mf_profile)
+      { g_mfProfile.addSec += std::chrono::duration<double>(std::chrono::steady_clock::now() - __tC0).count(); }
       auto __tD0 = std::chrono::steady_clock::now();
 #endif
       // --- Factor, restricted to the eligible (fully-summed) block. ---
       MatrixX D;
       DenseLDLTResult res = DenseLDLT<Scalar>::factor(F, D, options, nEligible);
 #ifdef SYMLA_PROFILE
-      g_mfProfile.factorSec += std::chrono::duration<double>(std::chrono::steady_clock::now() - __tD0).count();
+#pragma omp critical(symla_mf_profile)
+      { g_mfProfile.factorSec += std::chrono::duration<double>(std::chrono::steady_clock::now() - __tD0).count(); }
 #endif
 
-      nf.inertia.n_pos += res.inertia.n_pos;
-      nf.inertia.n_neg += res.inertia.n_neg;
-      nf.inertia.n_zero += res.inertia.n_zero;
+      perFrontInertia[si] = res.inertia;
 
       const int nFactored = res.n_factored;
 
@@ -368,7 +476,7 @@ class MultifrontalFactorizer {
       sfac.L = F.leftCols(nFactored);
       sfac.D = D.topLeftCorner(nFactored, nFactored);
       sfac.pivotBlocks = res.pivots;
-      nf.fronts.push_back(std::move(sfac));
+      nf.fronts[si] = std::move(sfac);
 
       // --- Forward the remainder (still-eligible-but-delayed columns +
       // ancestor rows) to the parent, or flag as singular if there is none. ---
@@ -376,6 +484,7 @@ class MultifrontalFactorizer {
       if (leftover > 0) {
         const int psn = parentSN[si];
         if (psn == -1) {
+          std::lock_guard<std::mutex> lock(singularMutex);
           nf.singular = true;
           for (int i = nFactored; i < m; ++i) nf.singularCols.push_back(globalOf(i));
         } else {
@@ -386,6 +495,45 @@ class MultifrontalFactorizer {
           genElem[si] = std::move(ge);
         }
       }
+    };
+
+#ifdef SYMLA_HAVE_OPENMP
+    if (mfOptions.parallel) {
+      // Avoid oversubscription: Eigen's own internal multi-threaded GEMM
+      // would otherwise compete with the outer OpenMP task parallelism
+      // across many concurrent small-to-medium fronts (each front's
+      // `DenseLDLT::factor`/extend-add uses Eigen ops internally). Pinned
+      // for the duration of this call; restored afterward. Left as a
+      // simple global pin rather than adaptively re-enabling Eigen
+      // threading for the handful of very large fronts real matrices like
+      // bratu3d produce (a nested-parallelism tuning left for later, see
+      // the Phase 6 handoff notes) -- this is the "keep it simple" default
+      // the Phase 6 plan calls for.
+      const int savedEigenThreads = Eigen::nbThreads();
+      Eigen::setNbThreads(1);
+
+      if (mfOptions.num_threads > 0) {
+        omp_set_num_threads(mfOptions.num_threads);
+      }
+
+#pragma omp parallel
+      {
+#pragma omp single
+        { parallel::runTaskDag(rootsSN, childrenSN, subtreeWeight, mfOptions.task_cutoff, processSupernode); }
+      }
+
+      Eigen::setNbThreads(savedEigenThreads);
+    } else {
+      for (int si = 0; si < numSN; ++si) processSupernode(si);
+    }
+#else
+    for (int si = 0; si < numSN; ++si) processSupernode(si);
+#endif
+
+    for (int si = 0; si < numSN; ++si) {
+      nf.inertia.n_pos += perFrontInertia[si].n_pos;
+      nf.inertia.n_neg += perFrontInertia[si].n_neg;
+      nf.inertia.n_zero += perFrontInertia[si].n_zero;
     }
 
     std::sort(nf.singularCols.begin(), nf.singularCols.end());

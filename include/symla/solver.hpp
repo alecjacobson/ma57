@@ -31,6 +31,21 @@ class SymLDLT {
   void setPivotThreshold(double u) { pivot_threshold_ = u; }
   void setOrdering(OrderingType ordering) { ordering_ = ordering; }
 
+  // Phase 6: task-DAG parallel factorize() over the supernode tree (see
+  // multifrontal.hpp / parallel/task_graph.hpp). Default is parallel with
+  // however many threads OpenMP reports available
+  // (`omp_get_max_threads()`/`OMP_NUM_THREADS`) whenever the library was
+  // built with OpenMP support (`SYMLA_HAVE_OPENMP`); with no OpenMP support
+  // compiled in, this setting is a no-op and factorize() is always the
+  // single-threaded Phase 3 driver. `setParallel(false)` forces the exact
+  // same single-threaded postorder loop regardless of OpenMP availability
+  // (useful for deterministic debugging/reference runs, and for the
+  // single- vs multi-thread equivalence tests in test/concurrency).
+  void setParallel(bool parallel) { parallel_ = parallel; }
+  // 0 (default) means "use whatever omp_get_max_threads() currently
+  // reports"; a positive value pins factorize() to that many threads.
+  void setNumThreads(int numThreads) { num_threads_ = numThreads; }
+
   // Analyze sparsity pattern only (ordering + symbolic factorization).
   // `options` controls the relaxed-amalgamation caps (symbolic.hpp); the
   // default reproduces the library's standard behavior, an explicit value
@@ -49,7 +64,14 @@ class SymLDLT {
     }
     DenseLDLTOptions opts;
     opts.pivot_threshold = pivot_threshold_;
-    numeric_ = MultifrontalFactorizer<Scalar>::factorize(symbolic_, A, opts);
+    MultifrontalOptions mfOpts;
+#ifdef SYMLA_HAVE_OPENMP
+    mfOpts.parallel = parallel_;
+#else
+    mfOpts.parallel = false;
+#endif
+    mfOpts.num_threads = num_threads_;
+    numeric_ = MultifrontalFactorizer<Scalar>::factorize(symbolic_, A, opts, mfOpts);
     inertia_ = numeric_.inertia;
     factorized_ = true;
   }
@@ -128,6 +150,12 @@ class SymLDLT {
   Mode mode_ = Mode::ThresholdPivot;
   double pivot_threshold_ = 0.01;
   OrderingType ordering_ = OrderingType::AMD;
+#ifdef SYMLA_HAVE_OPENMP
+  bool parallel_ = true;
+#else
+  bool parallel_ = false;
+#endif
+  int num_threads_ = 0;
   bool pattern_analyzed_ = false;
   bool factorized_ = false;
   Inertia inertia_;

@@ -56,6 +56,13 @@ target_link_libraries(symla_kkt_test PRIVATE symla::symla)
 target_include_directories(symla_kkt_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/unit)
 add_test(NAME kkt_test COMMAND symla_kkt_test)
 
+# Phase 7: KKT-aware static pivoting + inertia-controlled regularization +
+# iterative refinement (Mode::StaticRegularized).
+add_executable(symla_kkt_static_pivoting_test correctness/kkt_static_pivoting_test.cpp)
+target_link_libraries(symla_kkt_static_pivoting_test PRIVATE symla::symla)
+target_include_directories(symla_kkt_static_pivoting_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/unit)
+add_test(NAME kkt_static_pivoting_test COMMAND symla_kkt_static_pivoting_test)
+
 # Controlled-conditioning correctness fuzzing.
 add_executable(symla_conditioning_fuzz_test correctness/conditioning_fuzz_test.cpp)
 target_link_libraries(symla_conditioning_fuzz_test PRIVATE symla::symla)

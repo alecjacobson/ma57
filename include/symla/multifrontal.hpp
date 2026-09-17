@@ -152,6 +152,12 @@ struct NumericFactor {
                                    // pivoted anywhere, including at the root
                                    // (genuine numerical rank deficiency)
   int n = 0;
+
+  // Phase 7 diagnostics (always 0 unless MultifrontalOptions::
+  // static_pivoting was set): total diagonal perturbation magnitude applied
+  // across all fronts, and how many pivots needed it.
+  double totalPerturbation = 0.0;
+  int numPerturbed = 0;
 };
 
 namespace detail {
@@ -230,6 +236,21 @@ struct MultifrontalOptions {
   // task -- avoids task-creation overhead dominating for the very common
   // case of many tiny leaf supernodes. See parallel::runTaskDag.
   long long task_cutoff = 8;
+
+  // Phase 7: when set, every front is factored with `DenseLDLT::
+  // factorStatic` (KKT-aware static pivoting, see dense_kernel.hpp) instead
+  // of the ordinary Bunch-Kaufman-threshold `DenseLDLT::factor`. Static
+  // pivoting never delays a column (see factorStatic's doc comment), so
+  // `extraFromChildren` below is always empty under this mode in practice
+  // (harmless either way: the bookkeeping paths that handle it work
+  // correctly with zero delayed columns).
+  bool static_pivoting = false;
+  StaticPivotOptions staticOptions;
+  // Expected pivot sign per *final-order* column index (size n; 0 = no
+  // expectation), built by solver.hpp from `setKKTBlockSizes`/
+  // `setExpectedSignPattern` and mapped through the ordering permutation.
+  // Ignored unless `static_pivoting` is set.
+  std::vector<int> expectedSign;
 };
 
 template <typename Scalar>
@@ -309,6 +330,8 @@ class MultifrontalFactorizer {
     // root) so a plain mutex is sufficient and never contended in the
     // common case.
     std::vector<Inertia> perFrontInertia(numSN);
+    std::vector<double> perFrontPerturbation(numSN, 0.0);
+    std::vector<int> perFrontNumPerturbed(numSN, 0);
     std::mutex singularMutex;
 
     // Phase 6: `globalToLocal` used to be a single array shared across the
@@ -453,13 +476,32 @@ class MultifrontalFactorizer {
 #endif
       // --- Factor, restricted to the eligible (fully-summed) block. ---
       MatrixX D;
-      DenseLDLTResult res = DenseLDLT<Scalar>::factor(F, D, options, nEligible);
+      DenseLDLTResult res;
+      if (mfOptions.static_pivoting) {
+        // Map the front's local physical positions -> expected sign, in
+        // final-order index space (frontIdx[j] is already a final-order
+        // index; see the front-index-order comment above).
+        std::vector<int> localExpectedSign(m, 0);
+        if (!mfOptions.expectedSign.empty()) {
+          for (int t = 0; t < m; ++t) {
+            const int g = frontIdx[t];
+            if (g >= 0 && g < static_cast<int>(mfOptions.expectedSign.size())) {
+              localExpectedSign[t] = mfOptions.expectedSign[g];
+            }
+          }
+        }
+        res = DenseLDLT<Scalar>::factorStatic(F, D, mfOptions.staticOptions, localExpectedSign, nEligible);
+      } else {
+        res = DenseLDLT<Scalar>::factor(F, D, options, nEligible);
+      }
 #ifdef SYMLA_PROFILE
 #pragma omp critical(symla_mf_profile)
       { g_mfProfile.factorSec += std::chrono::duration<double>(std::chrono::steady_clock::now() - __tD0).count(); }
 #endif
 
       perFrontInertia[si] = res.inertia;
+      perFrontPerturbation[si] = res.total_perturbation;
+      perFrontNumPerturbed[si] = res.num_perturbed;
 
       const int nFactored = res.n_factored;
 
@@ -534,6 +576,8 @@ class MultifrontalFactorizer {
       nf.inertia.n_pos += perFrontInertia[si].n_pos;
       nf.inertia.n_neg += perFrontInertia[si].n_neg;
       nf.inertia.n_zero += perFrontInertia[si].n_zero;
+      nf.totalPerturbation += perFrontPerturbation[si];
+      nf.numPerturbed += perFrontNumPerturbed[si];
     }
 
     std::sort(nf.singularCols.begin(), nf.singularCols.end());

@@ -46,6 +46,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 #include <vector>
 
 #include "symla/inertia.hpp"  // symla::Inertia
@@ -116,6 +117,30 @@ struct DenseLDLTResult {
                                        // A_permuted(i,j) == A_original(perm(i), perm(j))
   Inertia inertia;                    // sign counts among the n_factored factored pivots
   double max_growth = 1.0;            // max|entry| encountered / max|entry| of original A (growth factor)
+
+  // Phase 7 (static pivoting only; always 0/empty for the ordinary
+  // Bunch-Kaufman `factor()` path above): diagonal perturbation applied
+  // while accepting pivots, see `DenseLDLT::factorStatic` below.
+  double total_perturbation = 0.0;    // sum of |delta| applied across all perturbed pivots
+  int num_perturbed = 0;              // count of pivots that needed perturbation
+};
+
+// Phase 7: options controlling `DenseLDLT::factorStatic` (KKT-aware static
+// pivoting), see the function's doc comment.
+struct StaticPivotOptions {
+  // Diagonal perturbation magnitude to add (sign-matched to the expected/
+  // observed pivot sign) when a pivot is judged unacceptable. If <= 0, a
+  // default of `sqrt(machine epsilon) * front_scale` is used (front_scale ==
+  // this call's `orig_max`, i.e. the max|entry| of the front before
+  // factoring). The inertia-controlled retry loop in solver.hpp escalates
+  // this geometrically across factorize() attempts.
+  double delta = 0.0;
+
+  // A pivot is judged "too small to use directly" (and thus perturbed) when
+  // |A(k,k)| < max(absolute_floor, relative_pivot_floor * front_scale).
+  // Mirrors DenseLDLTOptions::relative_pivot_floor's semantics/rationale.
+  double relative_pivot_floor = 1e-8;
+  double absolute_floor = 1e-300;
 };
 
 template <typename Scalar>
@@ -467,6 +492,147 @@ class DenseLDLT {
     // multifrontal front's ancestor rows) were never candidates to begin
     // with and must not be reported as delayed.
     for (int j = k; j < effEnd; ++j) result.delayed_cols.push_back(j);
+    result.max_growth = running_max / orig_max;
+    return result;
+  }
+
+  // Phase 7: KKT-aware *static* pivoting (PARDISO-SBK-style / Vanderbei
+  // SQD-theory-style). Unlike `factor()` above, this performs **no pivot
+  // search and no row/column swaps at all**: columns 0..n_eligible-1 are
+  // taken strictly in the given order, always as 1x1 pivots.
+  //
+  // Rationale (Vanderbei 1995, "Symmetric Quasidefinite Matrices"): a
+  // symmetric quasidefinite matrix K = [[-E, A^T], [A, F]] with E, F
+  // symmetric positive definite admits an LDL^T factorization (all 1x1
+  // pivots, no zero/near-zero pivots) for *any* symmetric permutation of
+  // its rows/columns, not just a specially chosen one -- so once the
+  // caller has arranged (via `expectedSign`) which pivots should come out
+  // negative (the -E block) vs. positive (the F block), pure diagonal
+  // pivoting in a fixed, sparsity-driven order (e.g. AMD/METIS, applied
+  // without regard to numerical stability) is provably safe for an exactly
+  // quasidefinite input. Real KKT systems from interior-point methods are
+  // usually only *near*-quasidefinite (e.g. a barrier term driving one
+  // diagonal block toward singular, or an exactly-zero block in an
+  // equality-constrained QP), so this function also supports diagonal
+  // regularization (Gill/Saunders/Shinnerl 1996; Wachter & Biegler 2006
+  // IPOPT inertia control; PARDISO static-pivoting + diagonal perturbation,
+  // Schenk & Gaertner): whenever a pivot's magnitude is below a floor, or
+  // its sign disagrees with the caller-supplied expectation, this adds
+  // `delta * expected_sign` to the diagonal before using it -- i.e. it
+  // factors A + Delta for some (tracked) diagonal perturbation Delta, not
+  // exactly A. The caller (solver.hpp's inertia-controlled retry loop) is
+  // responsible for checking the resulting inertia and escalating `delta`
+  // if it doesn't match expectations, and `refine.hpp`'s iterative
+  // refinement is responsible for recovering the accuracy lost to Delta
+  // against the true (unperturbed) system.
+  //
+  // `expectedSign` is indexed exactly like the front-local physical
+  // position (no permutation ever happens in this function, so "front-local
+  // physical position" and "front-local column index" are the same thing
+  // throughout): expectedSign[k] in {-1, 0, +1}; 0 means "no expectation for
+  // this column" (perturb only if the raw magnitude is below the floor,
+  // pushing towards whatever sign the unperturbed pivot already had, or +1
+  // for an exact zero). A short/empty vector is treated as all-zero
+  // (unconstrained) for the remaining columns.
+  //
+  // Because every eligible column is always finalized here (perturbation
+  // guarantees an acceptable pivot always exists), `n_factored` is always
+  // exactly `n_eligible` and `delayed_cols`/`perm` are always empty/identity
+  // -- static pivoting never delays a column to the parent front, by
+  // construction (see multifrontal.hpp's Phase 7 notes on why this
+  // simplifies the driver's bookkeeping).
+  static DenseLDLTResult factorStatic(Eigen::Ref<MatrixX> A, MatrixX& D_out, const StaticPivotOptions& options,
+                                       const std::vector<int>& expectedSign, int n_eligible = -1) {
+    const int n = static_cast<int>(A.rows());
+    if (A.cols() != n) throw std::invalid_argument("DenseLDLT::factorStatic: A must be square");
+    const int effEnd = (n_eligible < 0) ? n : n_eligible;
+    if (effEnd < 0 || effEnd > n) throw std::invalid_argument("DenseLDLT::factorStatic: n_eligible out of range");
+
+    DenseLDLTResult result;
+    result.perm = Eigen::VectorXi::LinSpaced(n, 0, n - 1);
+    D_out = MatrixX::Zero(n, n);
+
+    for (int j = 0; j < n; ++j)
+      for (int i = j + 1; i < n; ++i) A(j, i) = A(i, j);
+
+    double orig_max = A.cwiseAbs().maxCoeff();
+    if (orig_max < options.absolute_floor) orig_max = 1.0;
+    double running_max = orig_max;
+
+    const double delta = options.delta > 0.0 ? options.delta : std::sqrt(std::numeric_limits<double>::epsilon()) * orig_max;
+    const double floor = std::max(options.absolute_floor, options.relative_pivot_floor * orig_max);
+
+    auto resymmetrizeTrailing = [&](auto trailingBlock) {
+      const int extent = static_cast<int>(trailingBlock.rows());
+      for (int j = 0; j < extent; ++j) {
+        for (int i = j + 1; i < extent; ++i) {
+          const double avg = 0.5 * (trailingBlock(i, j) + trailingBlock(j, i));
+          trailingBlock(i, j) = avg;
+          trailingBlock(j, i) = avg;
+        }
+      }
+    };
+
+    for (int k = 0; k < effEnd; ++k) {
+      const int m = n - k;
+      const double a_kk = A(k, k);
+      const int sign = (k < static_cast<int>(expectedSign.size())) ? expectedSign[k] : 0;
+
+      double d = a_kk;
+      double applied = 0.0;
+      bool needPerturb = false;
+      if (sign > 0) {
+        needPerturb = a_kk < floor;
+      } else if (sign < 0) {
+        needPerturb = a_kk > -floor;
+      } else {
+        needPerturb = std::abs(a_kk) < floor;
+      }
+
+      if (needPerturb) {
+        // IPOPT/PARDISO-SBK-style: add a single sign-matched perturbation
+        // of magnitude `delta` and use whatever pivot that produces --
+        // deliberately NOT forced/looped to guarantee an acceptable
+        // magnitude or sign within this single pass. If `delta` isn't large
+        // enough (e.g. a_kk had the wrong sign by more than `delta`), the
+        // resulting pivot may still be small or wrong-signed; that is
+        // exactly the case the inertia-controlled retry loop in
+        // solver.hpp's `factorizeStaticRegularized()` is meant to detect
+        // (via a mismatched `inertia()` afterwards) and correct by
+        // re-factoring from scratch with `delta` escalated, not something
+        // this single-pass function silently papers over.
+        const double s = (sign != 0) ? static_cast<double>(sign) : (a_kk >= 0.0 ? 1.0 : -1.0);
+        d = a_kk + s * delta;
+        applied = d - a_kk;
+      }
+
+      D_out(k, k) = d;
+      result.pivots.push_back({k, PivotKind::OneByOne});
+      if (applied != 0.0) {
+        result.total_perturbation += std::abs(applied);
+        ++result.num_perturbed;
+      }
+      if (d > 0)
+        ++result.inertia.n_pos;
+      else if (d < 0)
+        ++result.inertia.n_neg;
+      else
+        ++result.inertia.n_zero;
+
+      running_max = std::max(running_max, std::abs(d));
+      if (m > 1) {
+        VectorX l = A.col(k).segment(k + 1, m - 1) / d;
+        running_max = std::max(running_max, A.block(k + 1, k, m - 1, 1).cwiseAbs().maxCoeff());
+        auto trailing = A.block(k + 1, k + 1, m - 1, m - 1);
+        trailing.noalias() -= (d * l) * l.transpose();
+        resymmetrizeTrailing(trailing);
+        A.col(k).segment(k + 1, m - 1) = l;
+        A.row(k).segment(k + 1, m - 1) = l.transpose();
+        running_max = std::max(running_max, trailing.cwiseAbs().maxCoeff());
+      }
+    }
+
+    result.n_factored = effEnd;
     result.max_growth = running_max / orig_max;
     return result;
   }

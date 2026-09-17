@@ -214,3 +214,18 @@ bench/                fetch_matrices.py, bench_main.cpp, results/ (gitignored)
   same task-DAG approach in the future).
 - Iterative refinement is fixed-precision, not mixed-precision GMRES-IR.
 - No GPU backend.
+
+
+## LLM Usage
+
+Everything above this (and in the other files) was written by Claude code while I waited to get an academic-use license from HSL for MA57.
+Obviously, I don't know if Anthropic's training has included the MA57 source code. 
+I also don't know whether my Claude code instance went against my explicit direction to not look for or look at MA57 source code.
+I can only say with certainty that I did not provide access to that code, nor did I have access to that code at the time this was generated.
+At the time of writing this my prompts were:
+
+>  Reimplement (without looking for or looking at their official code) the method of "MA57—A Code for the Solution of Sparse Symmetric Definite and Indefinite Systems" using Eigen in C++. The goal should be to outperform SuiteSparse and EigenLDL and LU on large sparse indefinite symmetric systems. Like those arising from KKT systems. Use a variety of regression testing for performance, accuracy, stability and robustness. A fully featured solver should enable precomputation stages for fixed pattern, fixed system,  and finally a solve stage for known rhs (which could have multiple columns). Research first. Take advantage of ideas that have emerged since the MA57 paper, but keep in mind that MA57 is still standard ldl for large sparse systems in matlab etc. So the primary goal is matching or exceeding MA57's expected bahavior in terms of performance, accuracy and robustness. Leverage parallelism. Make a plan and work independently.
+
+> commit and push.
+
+> Can you add a readme with usage instructions

@@ -50,8 +50,16 @@ inline void runTaskDag(const std::vector<int>& roots, const std::vector<std::vec
                         const std::vector<long long>& subtreeWeight, long long taskCutoff, ProcessFn&& process) {
 #ifdef SYMLA_HAVE_OPENMP
   std::function<void(int)> visit = [&](int node) {
+    // `omp taskwait` itself is not free (a real synchronization point with
+    // the runtime, even with zero outstanding child tasks) -- with many
+    // thousands of tree nodes, unconditionally paying it at every single
+    // one adds up fast once the cutoff below is doing its job and most
+    // subtrees are executed inline (no tasks spawned for them at all). Only
+    // pay for it when this node actually spawned at least one child task.
+    bool spawnedAny = false;
     for (int c : children[node]) {
       if (subtreeWeight[c] >= taskCutoff) {
+        spawnedAny = true;
 #pragma omp task default(shared) firstprivate(c)
         visit(c);
       } else {
@@ -61,7 +69,9 @@ inline void runTaskDag(const std::vector<int>& roots, const std::vector<std::vec
         visit(c);
       }
     }
+    if (spawnedAny) {
 #pragma omp taskwait
+    }
     process(node);
   };
   for (int r : roots) {

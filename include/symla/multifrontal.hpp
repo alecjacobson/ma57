@@ -56,6 +56,7 @@
 #ifdef SYMLA_PROFILE
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #endif
 
 namespace symla {
@@ -231,11 +232,23 @@ struct MultifrontalOptions {
   // many threads for this call via `omp_set_num_threads()`.
   int num_threads = 0;
 
-  // Subtree-size (in supernodes) below which a child subtree is executed
-  // inline by the same thread rather than spawned as a separate OpenMP
-  // task -- avoids task-creation overhead dominating for the very common
-  // case of many tiny leaf supernodes. See parallel::runTaskDag.
-  long long task_cutoff = 8;
+  // Subtree-cost cutoff below which a child subtree is executed inline by
+  // the same thread rather than spawned as a separate OpenMP task -- avoids
+  // task-creation/taskwait overhead dominating for the very common case of
+  // many tiny leaf supernodes. See parallel::runTaskDag.
+  //
+  // Units: a per-front FLOP-ish cost estimate (`ncols * m^2`, see
+  // `subtreeWeight` in `factorize()` below), summed over a subtree -- *not*
+  // a node count (an earlier version of this option counted supernodes,
+  // which meant subtrees with as few as 8 tiny fronts got spawned as tasks;
+  // that measured 30-50x slower than serial on real mesh matrices with many
+  // small fronts, see the project's performance-diagnosis notes).
+  //
+  // A negative value (the default) means "auto": `factorize()` derives a
+  // cutoff from the whole tree's total estimated cost and the thread count
+  // in use, aiming for roughly a handful of tasks per thread. Pass a
+  // non-negative value to override with an explicit absolute cost cutoff.
+  long long task_cutoff = -1;
 
   // Phase 7: when set, every front is factored with `DenseLDLT::
   // factorStatic` (KKT-aware static pivoting, see dense_kernel.hpp) instead
@@ -352,14 +365,37 @@ class MultifrontalFactorizer {
 #endif
     std::vector<std::vector<int>> globalToLocalTls(maxThreads, std::vector<int>(n, -1));
 
-    // Subtree weight (in supernodes) for the task-spawn-vs-inline cutoff
-    // heuristic; increasing-si order is already a valid postorder (see the
-    // header comment), so a single forward pass suffices.
-    std::vector<long long> subtreeWeight(numSN, 1);
+    // Subtree cost (a FLOP-ish proxy, *not* node count) for the
+    // task-spawn-vs-inline cutoff heuristic used by parallel::runTaskDag.
+    // Each front's own cost is estimated as `ncols * m^2` (m = the
+    // symbolic front dimension, sn.rowPattern.size(); ncols = the front's
+    // own eligible pivot columns, sn.ncols) -- the dominant term of the
+    // rank-k trailing-submatrix updates a dense LDL^T factorization of an
+    // m x m front with ncols pivot columns performs (dominates the
+    // ncols^2*m-ish pivot-search cost for the front sizes seen here). This
+    // is a *symbolic* estimate (computed before any runtime-delayed
+    // columns are known from children) -- fine for a scheduling heuristic,
+    // it doesn't need to be exact, just far better than treating every
+    // front as equally "1 unit" of work regardless of size (plain node
+    // count was the original bug here: with a fixed small node-count
+    // cutoff, a tree of mostly-tiny fronts spawned an OpenMP task for
+    // nearly every front, paying full task-creation/taskwait overhead for
+    // microseconds of real work -- see the project's performance-diagnosis
+    // notes). Increasing-si order is already a valid postorder (see the
+    // header comment), so a single forward pass suffices to accumulate
+    // subtree totals.
+    std::vector<long long> subtreeWeight(numSN, 0);
     for (int si = 0; si < numSN; ++si) {
+      const auto& sn = supernodes[si];
+      const long long m = static_cast<long long>(sn.rowPattern.size());
+      const long long snCols = sn.ncols;
+      const long long ownCost = std::max<long long>(1, snCols * m * m);
+      subtreeWeight[si] += ownCost;
       const int p = parentSN[si];
       if (p != -1) subtreeWeight[p] += subtreeWeight[si];
     }
+    long long totalCost = 0;
+    for (int r : rootsSN) totalCost += subtreeWeight[r];
 
     // --- The actual per-supernode work: extend-add assembly from children's
     // generated elements + A's own contribution, dense LDL^T factorization
@@ -541,30 +577,113 @@ class MultifrontalFactorizer {
 
 #ifdef SYMLA_HAVE_OPENMP
     if (mfOptions.parallel) {
-      // Avoid oversubscription: Eigen's own internal multi-threaded GEMM
-      // would otherwise compete with the outer OpenMP task parallelism
-      // across many concurrent small-to-medium fronts (each front's
-      // `DenseLDLT::factor`/extend-add uses Eigen ops internally). Pinned
-      // for the duration of this call; restored afterward. Left as a
-      // simple global pin rather than adaptively re-enabling Eigen
-      // threading for the handful of very large fronts real matrices like
-      // bratu3d produce (a nested-parallelism tuning left for later, see
-      // the Phase 6 handoff notes) -- this is the "keep it simple" default
-      // the Phase 6 plan calls for.
-      const int savedEigenThreads = Eigen::nbThreads();
-      Eigen::setNbThreads(1);
-
-      if (mfOptions.num_threads > 0) {
-        omp_set_num_threads(mfOptions.num_threads);
+      // Derive an absolute task-spawn cutoff (same `ncols * m^2` cost units
+      // as `subtreeWeight` above) when the caller didn't pin one
+      // explicitly (`task_cutoff < 0`, the default). Target roughly a
+      // handful of tasks per thread -- enough granularity for the runtime
+      // to load-balance without spawning a task for every tiny front (the
+      // original bug: a fixed *node-count* cutoff of 8 meant nearly every
+      // front in a many-small-fronts tree got spawned as a task, and
+      // OpenMP task-creation/taskwait overhead dominated the microseconds
+      // of real work each one did -- see the project's performance-
+      // diagnosis notes for the measured 30-50x slowdown this caused on
+      // real mesh matrices).
+      //
+      // Separately: `maxThreads` above is "how many OS threads OpenMP
+      // *could* give us" (omp_get_max_threads(), which on a big multi-
+      // socket box can be 100+). Empirically (see the project's
+      // performance-diagnosis notes), spinning up a team of that many
+      // threads for a modest-cost tree is itself expensive -- team
+      // creation/coordination cost scales with team size roughly
+      // independent of how much real work is available to hand out, so
+      // using every available thread on a small-to-medium tree can be
+      // *slower* than using far fewer (measured directly on this machine:
+      // a 34M-cost-unit tree went from 0.033s serial to 0.018s at 16
+      // threads but 0.60s -- 18x worse than serial -- at 128 threads; a
+      // 369M-cost-unit tree similarly peaked around 24 threads and got
+      // worse again by 128). Unless the caller pinned an explicit thread
+      // count (`num_threads > 0`), scale the requested team size with the
+      // tree's total estimated cost instead of always requesting every
+      // available thread.
+      int effectiveThreads = maxThreads;
+      if (mfOptions.num_threads <= 0) {
+        // Calibrated against the same real mesh supernode trees as
+        // kMinTaskCost below: ~8e6 cost-units of total tree work per
+        // thread keeps small/medium trees (tens to hundreds of millions of
+        // cost-units) from over-threading while still letting genuinely
+        // large trees (bratu3d-scale and up, billions of cost-units) scale
+        // up toward the full machine.
+        constexpr long long kCostPerThread = 8'000'000;
+        const long long threadsFromCost = totalCost / kCostPerThread;
+        effectiveThreads = static_cast<int>(std::min<long long>(maxThreads, std::max<long long>(1, threadsFromCost)));
       }
+
+      long long cutoff = mfOptions.task_cutoff;
+      if (cutoff < 0) {
+        constexpr long long kTargetTasksPerThread = 4;
+        const long long targetTasks = std::max<long long>(1, kTargetTasksPerThread * effectiveThreads);
+        cutoff = totalCost > 0 ? std::max<long long>(1, totalCost / targetTasks) : 1;
+        // Absolute floor, independent of thread count: below this a
+        // front's real dense-kernel cost is only microseconds, too small
+        // for any number of threads to amortize OpenMP's per-task
+        // creation/taskwait overhead against. Calibrated empirically
+        // against real AMD-ordered mesh supernode trees (20K-face decimated
+        // dragon, n~10002): with this floor, parallel factorize() lands
+        // close to serial time instead of 30-50x worse. `ncols * m^2` for a
+        // front with ncols~m~64 (a mid-sized, clearly-worth-it front) is
+        // ~2.6e5, so this floor is comfortably below "obviously worth a
+        // task" while well above the sea of tiny leaf fronts AMD produces.
+        constexpr long long kMinTaskCost = 1 << 17;  // 131072
+        cutoff = std::max(cutoff, kMinTaskCost);
+      }
+      if (std::getenv("SYMLA_DEBUG_SCHED")) {
+        std::fprintf(stderr, "SYMLA_DEBUG_SCHED numSN=%d maxThreads=%d effectiveThreads=%d totalCost=%lld cutoff=%lld\n",
+                     numSN, maxThreads, effectiveThreads, totalCost, cutoff);
+      }
+
+      // Global bypass: if the *entire* tree's estimated cost can't clear a
+      // small multiple of the per-task floor, there's no way to build even
+      // one worthwhile task out of it -- skip opening the OpenMP parallel
+      // region entirely (avoids paying thread-team spin-up/coordination
+      // cost for problems where parallelism can never pay off) and just
+      // run the plain serial postorder loop instead.
+      constexpr long long kMinTotalCostForParallel = (1 << 17) * 4;
+      if (totalCost < kMinTotalCostForParallel) {
+        for (int si = 0; si < numSN; ++si) processSupernode(si);
+      } else {
+        // Avoid oversubscription: Eigen's own internal multi-threaded GEMM
+        // would otherwise compete with the outer OpenMP task parallelism
+        // across many concurrent small-to-medium fronts (each front's
+        // `DenseLDLT::factor`/extend-add uses Eigen ops internally). Pinned
+        // for the duration of this call; restored afterward. Left as a
+        // simple global pin rather than adaptively re-enabling Eigen
+        // threading for the handful of very large fronts real matrices
+        // like bratu3d produce (a nested-parallelism tuning left for
+        // later, see the Phase 6 handoff notes) -- this is the "keep it
+        // simple" default the Phase 6 plan calls for.
+        const int savedEigenThreads = Eigen::nbThreads();
+        Eigen::setNbThreads(1);
+
+        // omp_set_num_threads() changes process-global OpenMP state (the
+        // "icv" the runtime consults whenever a new parallel region opens
+        // without an explicit num_threads() clause), so it must be
+        // restored afterward -- otherwise a small/medium factorize() call
+        // that (correctly) throttles itself to a handful of threads would
+        // silently also throttle every *subsequent* factorize() call in
+        // the process, including unrelated larger ones, since
+        // omp_get_max_threads() would keep reporting the throttled value.
+        const int savedOmpMaxThreads = omp_get_max_threads();
+        omp_set_num_threads(mfOptions.num_threads > 0 ? mfOptions.num_threads : effectiveThreads);
 
 #pragma omp parallel
-      {
+        {
 #pragma omp single
-        { parallel::runTaskDag(rootsSN, childrenSN, subtreeWeight, mfOptions.task_cutoff, processSupernode); }
-      }
+          { parallel::runTaskDag(rootsSN, childrenSN, subtreeWeight, cutoff, processSupernode); }
+        }
 
-      Eigen::setNbThreads(savedEigenThreads);
+        omp_set_num_threads(savedOmpMaxThreads);
+        Eigen::setNbThreads(savedEigenThreads);
+      }
     } else {
       for (int si = 0; si < numSN; ++si) processSupernode(si);
     }

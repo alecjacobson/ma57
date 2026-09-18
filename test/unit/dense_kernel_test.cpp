@@ -47,7 +47,7 @@ using Vec = Eigen::VectorXd;
 // lower entry at (k+1, k) of `factored` holds D's off-diagonal d21, *not*
 // an L multiplier (L's diagonal blocks are always identity), so that
 // position must be excluded when extracting L.
-Mat reconstructPAPT(const Mat& factored, const Mat& D, int nf,
+Mat reconstructPAPT(const Mat& factored, const symla::BlockDiagonalD<double>& D, int nf,
                      const std::vector<symla::PivotBlock>& pivots) {
   Mat L = Mat::Identity(nf, nf);
   for (int j = 0; j < nf; ++j)
@@ -55,7 +55,7 @@ Mat reconstructPAPT(const Mat& factored, const Mat& D, int nf,
   for (const auto& pb : pivots) {
     if (pb.kind == symla::PivotKind::TwoByTwo && pb.start + 1 < nf) L(pb.start + 1, pb.start) = 0.0;
   }
-  Mat Dsub = D.topLeftCorner(nf, nf);
+  Mat Dsub = D.head(nf).toDense();
   return L * Dsub * L.transpose();
 }
 
@@ -71,7 +71,8 @@ Mat applyPerm(const Mat& A, const Eigen::VectorXi& perm, int nf) {
 // Tiny forward/diag(block)/back substitution solver using the DenseLDLT
 // output directly, for full-size (n_factored == n) factorizations. Solves
 // A x = b given the *original* (unpermuted) A implicitly via perm.
-Vec solveFromFactorization(const Mat& factored, const Mat& D, const DenseLDLTResult& res, const Vec& b) {
+Vec solveFromFactorization(const Mat& factored, const symla::BlockDiagonalD<double>& D, const DenseLDLTResult& res,
+                            const Vec& b) {
   const int n = static_cast<int>(b.size());
   SYMLA_CHECK(res.n_factored == n);
   // Permute b: bp(i) = b(perm(i))
@@ -210,7 +211,7 @@ void testHandVerified3x3Diagonal() {
   A << 10, 1, 1,
         1, 8, 1,
         1, 1, 6;
-  Mat D;
+  symla::BlockDiagonalD<double> D;
   auto res = DenseLDLT<double>::factor(A, D);
   SYMLA_CHECK(res.n_factored == 3);
   SYMLA_CHECK(static_cast<int>(res.pivots.size()) == 3);
@@ -240,7 +241,7 @@ void testHandVerifiedForces2x2() {
        1, 0, 0.3,
        0.2, 0.3, 5.0;
   Mat A0 = A;
-  Mat D;
+  symla::BlockDiagonalD<double> D;
   auto res = DenseLDLT<double>::factor(A, D);
   SYMLA_CHECK(res.n_factored == 3);
   SYMLA_CHECK(!res.pivots.empty());
@@ -263,7 +264,7 @@ void testHandVerified5x5Mixed() {
         0.1, 0.1, 2, 0, 0.2,
         0.1, 0.1, 0.1, 0.2, 12;
   Mat A0 = A;
-  Mat D;
+  symla::BlockDiagonalD<double> D;
   auto res = DenseLDLT<double>::factor(A, D);
   SYMLA_CHECK(res.n_factored == 5);
   Mat rec = reconstructPAPT(A, D, 5, res.pivots);
@@ -279,7 +280,7 @@ void testHandVerified5x5Mixed() {
 void testResidualRandom(int n, unsigned seed) {
   Mat A0 = randomSymmetricIndefiniteEig(n, seed);
   Mat A = A0;
-  Mat D;
+  symla::BlockDiagonalD<double> D;
   DenseLDLTOptions opts;
   auto res = DenseLDLT<double>::factor(A, D, opts);
   SYMLA_CHECK(res.n_factored == n);
@@ -304,7 +305,7 @@ void testResidualRandom(int n, unsigned seed) {
 void testLapackCrossCheck(int n, unsigned seed) {
   Mat A0 = randomSymmetricIndefiniteEig(n, seed);
   Mat A = A0;
-  Mat D;
+  symla::BlockDiagonalD<double> D;
   auto res = DenseLDLT<double>::factor(A, D);
   SYMLA_CHECK(res.n_factored == n);
 
@@ -346,7 +347,7 @@ void testDelayedPivotAllZeroTrailingBlock() {
   A(1, 2) = A(2, 1) = 0.2;
   // rows/cols 3,4 (and their coupling to 0..2) are all zero -> structurally singular trailing block.
   Mat A0 = A;
-  Mat D;
+  symla::BlockDiagonalD<double> D;
   auto res = DenseLDLT<double>::factor(A, D);
 
   SYMLA_CHECK(res.n_factored == 3);
@@ -375,7 +376,7 @@ void testDelayedPivotRankDeficient2x2() {
   DenseLDLTOptions opts;
   opts.zero_tolerance = 1e-8;
   Mat A0 = A;
-  Mat D;
+  symla::BlockDiagonalD<double> D;
   auto res = DenseLDLT<double>::factor(A, D, opts);
 
   SYMLA_CHECK(res.n_factored == 1);

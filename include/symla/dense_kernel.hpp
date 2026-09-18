@@ -26,9 +26,10 @@
 //   - L: unit lower triangular, stored in the strictly-lower part of the
 //     (in-place factored) input matrix A.
 //   - D: block diagonal (1x1 and 2x2 blocks), returned separately in
-//     `D_out` (a full n x n matrix but only the block-diagonal entries --
-//     diagonal and the single off-diagonal per 2x2 block -- are populated;
-//     everything else is left as zero).
+//     `D_out` (a `BlockDiagonalD`, O(n) storage: a diagonal vector plus a
+//     parallel vector holding the single off-diagonal per 2x2 block --
+//     see `BlockDiagonalD`'s doc comment above for the compact layout and
+//     why a dense n x n matrix is unnecessary).
 //
 // Degenerate / delayed pivots: if, at some column k, no numerically
 // acceptable 1x1 or 2x2 pivot can be found in the trailing submatrix
@@ -101,6 +102,89 @@ struct DenseLDLTOptions {
   double relative_pivot_floor = 1e-12;
 };
 
+// D is block-diagonal by construction (only 1x1 and 2x2 blocks along the
+// diagonal -- see PivotBlock/PivotKind below), so representing it as a dense
+// n x n matrix (as an earlier version of this code did) wastes O(n^2)
+// storage/zeroing time for what only ever needs O(n): the diagonal, plus (at
+// most) one off-diagonal entry per 2x2 pivot block. This type stores exactly
+// that -- a diagonal vector plus a parallel "d21" vector, indexed by the
+// *first* (lower) column of a would-be 2x2 block; entries at any index that
+// is not the start of an actual 2x2 pivot block stay structurally zero,
+// exactly matching the corresponding entry of a real dense block-diagonal D.
+//
+// `operator()(i, j)` mimics a dense matrix accessor restricted to exactly
+// the entries a block-diagonal D can ever have: the diagonal (i == j) and
+// the single permitted off-diagonal of a 2x2 block (|i - j| == 1). This
+// keeps every existing call site that reads/writes `D(k, k)`, `D(k+1, k)`,
+// `D(k, k+1)`, `D(k+1, k+1)` unchanged in spirit -- only the storage
+// underneath is compact. The mutable overload throws on any other (i, j)
+// (a caller asking for such an entry is a bug -- a real block-diagonal D
+// simply cannot have one); the const overload returns 0 there, matching
+// what a dense D would actually contain.
+template <typename Scalar>
+struct BlockDiagonalD {
+  using VectorX = Eigen::Matrix<Scalar, Eigen::Dynamic, 1>;
+
+  VectorX diag;     // size n: D(k, k)
+  VectorX offdiag;  // size n: offdiag(k) == D(k+1, k) for a 2x2 block starting at column k, else 0
+
+  void resize(int n) {
+    diag = VectorX::Zero(n);
+    offdiag = VectorX::Zero(n);
+  }
+  int size() const { return static_cast<int>(diag.size()); }
+  int rows() const { return size(); }
+  int cols() const { return size(); }
+
+  Scalar operator()(int i, int j) const {
+    if (i == j) return diag(i);
+    if (i == j + 1) return offdiag(j);
+    if (j == i + 1) return offdiag(i);
+    return Scalar(0);
+  }
+  Scalar& operator()(int i, int j) {
+    if (i == j) return diag(i);
+    if (i == j + 1) return offdiag(j);
+    if (j == i + 1) return offdiag(i);
+    throw std::invalid_argument(
+        "BlockDiagonalD::operator(): only diagonal / adjacent 2x2-block entries are addressable");
+  }
+
+  // Leading `n`-sized sub-block (block-diagonal structure means this is just
+  // `head(n)` of both vectors -- there is no real "corner" to speak of).
+  BlockDiagonalD head(int n) const {
+    BlockDiagonalD out;
+    out.diag = diag.head(n);
+    out.offdiag = offdiag.head(n);
+    return out;
+  }
+
+  template <typename Target>
+  BlockDiagonalD<Target> cast() const {
+    BlockDiagonalD<Target> out;
+    out.diag = diag.template cast<Target>();
+    out.offdiag = offdiag.template cast<Target>();
+    return out;
+  }
+
+  // Materializes the full dense n x n block-diagonal matrix. Test/debug
+  // convenience only -- production code should never need this; avoiding
+  // exactly this materialization is the point of this type.
+  Eigen::Matrix<Scalar, Eigen::Dynamic, Eigen::Dynamic> toDense() const {
+    const int n = size();
+    Eigen::Matrix<Scalar, Eigen::Dynamic, Eigen::Dynamic> out =
+        Eigen::Matrix<Scalar, Eigen::Dynamic, Eigen::Dynamic>::Zero(n, n);
+    for (int k = 0; k < n; ++k) out(k, k) = diag(k);
+    for (int k = 0; k + 1 < n; ++k) {
+      if (offdiag(k) != Scalar(0)) {
+        out(k + 1, k) = offdiag(k);
+        out(k, k + 1) = offdiag(k);
+      }
+    }
+    return out;
+  }
+};
+
 enum class PivotKind { OneByOne, TwoByTwo };
 
 struct PivotBlock {
@@ -153,7 +237,7 @@ class DenseLDLT {
   // place. On return:
   //   - The strictly-lower part of A (rows/cols < n_factored) holds the
   //     multipliers of L (unit diagonal implied, not stored).
-  //   - D_out holds the block-diagonal D (n x n, mostly zero; see above).
+  //   - D_out holds the block-diagonal D (compact `BlockDiagonalD`; see above).
   //   - Entries of A/D_out at or beyond n_factored (i.e. touching any
   //     delayed column) are left in an unspecified but harmless state; the
   //     caller (Phase 3) is expected to re-assemble delayed columns into
@@ -180,7 +264,7 @@ class DenseLDLT {
   // factored pivots -- i.e. it is directly usable as a multifrontal
   // "generated element" / update matrix, not just "harmless but
   // unspecified" as in the pure Phase 2 (n_eligible == n) case.
-  static DenseLDLTResult factor(Eigen::Ref<MatrixX> A, MatrixX& D_out,
+  static DenseLDLTResult factor(Eigen::Ref<MatrixX> A, BlockDiagonalD<Scalar>& D_out,
                                  const DenseLDLTOptions& options = {}, int n_eligible = -1) {
     const int n = static_cast<int>(A.rows());
     if (A.cols() != n) throw std::invalid_argument("DenseLDLT::factor: A must be square");
@@ -191,7 +275,7 @@ class DenseLDLT {
 
     DenseLDLTResult result;
     result.perm = Eigen::VectorXi::LinSpaced(n, 0, n - 1);
-    D_out = MatrixX::Zero(n, n);
+    D_out.resize(n);
 
     // Mirror lower -> upper so we can freely read either triangle without
     // having to remember which is authoritative at each step (cheap; only
@@ -541,8 +625,9 @@ class DenseLDLT {
   // -- static pivoting never delays a column to the parent front, by
   // construction (see multifrontal.hpp's Phase 7 notes on why this
   // simplifies the driver's bookkeeping).
-  static DenseLDLTResult factorStatic(Eigen::Ref<MatrixX> A, MatrixX& D_out, const StaticPivotOptions& options,
-                                       const std::vector<int>& expectedSign, int n_eligible = -1) {
+  static DenseLDLTResult factorStatic(Eigen::Ref<MatrixX> A, BlockDiagonalD<Scalar>& D_out,
+                                       const StaticPivotOptions& options, const std::vector<int>& expectedSign,
+                                       int n_eligible = -1) {
     const int n = static_cast<int>(A.rows());
     if (A.cols() != n) throw std::invalid_argument("DenseLDLT::factorStatic: A must be square");
     const int effEnd = (n_eligible < 0) ? n : n_eligible;
@@ -550,7 +635,7 @@ class DenseLDLT {
 
     DenseLDLTResult result;
     result.perm = Eigen::VectorXi::LinSpaced(n, 0, n - 1);
-    D_out = MatrixX::Zero(n, n);
+    D_out.resize(n);
 
     for (int j = 0; j < n; ++j)
       for (int i = j + 1; i < n; ++i) A(j, i) = A(i, j);

@@ -119,8 +119,19 @@ struct SupernodeFactor {
   std::vector<int> rowIndices;          // size m, final-order indices
   int nPivots = 0;                      // number of finalized pivots (== n_factored at this front)
   Eigen::MatrixXd L;                    // m x nPivots
-  Eigen::MatrixXd D;                    // nPivots x nPivots, block-diagonal (see DenseLDLTResult::D_out)
+  BlockDiagonalD<double> D;              // nPivots-sized, block-diagonal (see BlockDiagonalD/DenseLDLTResult::D_out)
   std::vector<PivotBlock> pivotBlocks;  // local (0..nPivots-1) pivot structure
+
+  // Phase 8 (performance): `L`'s own `nPivots x nPivots` leading block, with
+  // the strictly-lower "d21 slot" of every 2x2 pivot block zeroed out (see
+  // solve.hpp's `maskedTopBlock` doc comment for exactly why this masking
+  // is needed for the triangular solve). Precomputed once here, at
+  // factorize() time, since it's a read-only, purely-derived-from-{L,
+  // pivotBlocks} quantity that's the same for every solve() call against
+  // this factorization -- solve.hpp used to recompute (allocate + copy) it
+  // on every front on every solve() call, which is wasted work for repeated
+  // solves against the same factorization.
+  Eigen::MatrixXd Ltop;                 // nPivots x nPivots
 };
 
 // Complete numeric factorization, front-by-front, in processing
@@ -531,7 +542,7 @@ class MultifrontalFactorizer {
       auto __tD0 = std::chrono::steady_clock::now();
 #endif
       // --- Factor, restricted to the eligible (fully-summed) block. ---
-      MatrixX D;
+      BlockDiagonalD<Scalar> D;
       DenseLDLTResult res;
       if (mfOptions.static_pivoting) {
         // Map the front's local physical positions -> expected sign, in
@@ -572,8 +583,12 @@ class MultifrontalFactorizer {
       sfac.rowIndices.resize(m);
       for (int i = 0; i < m; ++i) sfac.rowIndices[i] = globalOf(i);
       sfac.L = F.leftCols(nFactored);
-      sfac.D = D.topLeftCorner(nFactored, nFactored);
+      sfac.D = D.head(nFactored).template cast<double>();
       sfac.pivotBlocks = res.pivots;
+      sfac.Ltop = sfac.L.topRows(nFactored);
+      for (const auto& pb : sfac.pivotBlocks) {
+        if (pb.kind == PivotKind::TwoByTwo) sfac.Ltop(pb.start + 1, pb.start) = 0.0;
+      }
       nf.fronts[si] = std::move(sfac);
 
       // --- Forward the remainder (still-eligible-but-delayed columns +

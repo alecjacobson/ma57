@@ -64,7 +64,7 @@ void fuzzOne(int n, int avgNnzPerRow, unsigned seed, OrderingType ordering) {
 
   // (b) Inertia cross-check against an independent dense oracle.
   Eigen::MatrixXd Aoracle = Ad;
-  Eigen::MatrixXd Doracle;
+  symla::BlockDiagonalD<double> Doracle;
   auto oracleRes = symla::DenseLDLT<double>::factor(Aoracle, Doracle);
   SYMLA_CHECK(oracleRes.n_factored == n);  // the dense oracle should never need to delay on these matrices
 

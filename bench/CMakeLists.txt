@@ -36,3 +36,9 @@ target_link_libraries(symla_ordering_diag PRIVATE symla::symla)
 # (subtreeWeight cost estimate, task_cutoff, adaptive thread-count capping).
 add_executable(symla_parallel_diag parallel_diag_main.cpp)
 target_link_libraries(symla_parallel_diag PRIVATE symla::symla)
+
+# Serial-vs-parallel solve() timing diagnostic: used to calibrate the
+# task-DAG scheduling cost model in include/symla/solve.hpp (separately
+# from factorize()'s, since solve()'s per-front cost is much smaller).
+add_executable(symla_solve_parallel_diag solve_parallel_diag_main.cpp)
+target_link_libraries(symla_solve_parallel_diag PRIVATE symla::symla)

@@ -207,7 +207,14 @@ class SymLDLT {
     if (B.rows() != numeric_.n) {
       throw std::invalid_argument("symla::SymLDLT::solve: B.rows() must match the factorized matrix size");
     }
-    return MultifrontalSolver<Scalar>::solve(numeric_, B);
+    SolveOptions solveOpts;
+#ifdef SYMLA_HAVE_OPENMP
+    solveOpts.parallel = parallel_;
+#else
+    solveOpts.parallel = false;
+#endif
+    solveOpts.num_threads = num_threads_;
+    return MultifrontalSolver<Scalar>::solve(numeric_, B, solveOpts);
   }
 
   // Phase 7: `solve()` followed by classical iterative refinement against

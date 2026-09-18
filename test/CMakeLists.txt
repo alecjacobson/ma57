@@ -107,6 +107,14 @@ target_link_libraries(symla_supernode_amalgamation_regression_test PRIVATE symla
 target_include_directories(symla_supernode_amalgamation_regression_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/unit)
 add_test(NAME supernode_amalgamation_regression_test COMMAND symla_supernode_amalgamation_regression_test)
 
+# Task-DAG parallel solve() scheduling-cost-model regression guard (see the
+# file's header comment for root cause -- mirrors the factorize() Task 13
+# regression this project already fixed once).
+add_executable(symla_solve_parallel_regression_test stability/solve_parallel_regression_test.cpp)
+target_link_libraries(symla_solve_parallel_regression_test PRIVATE symla::symla)
+target_include_directories(symla_solve_parallel_regression_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/unit)
+add_test(NAME solve_parallel_regression_test COMMAND symla_solve_parallel_regression_test)
+
 # --- Phase 6: task-DAG parallelism (concurrency correctness) ---
 
 add_executable(symla_thread_equivalence_test concurrency/thread_equivalence_test.cpp)
@@ -118,6 +126,13 @@ add_executable(symla_repeated_run_determinism_test concurrency/repeated_run_dete
 target_link_libraries(symla_repeated_run_determinism_test PRIVATE symla::symla)
 target_include_directories(symla_repeated_run_determinism_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/unit)
 add_test(NAME repeated_run_determinism_test COMMAND symla_repeated_run_determinism_test)
+
+# Task-DAG parallel solve() correctness, isolated from factorize()'s own
+# parallelism (see the file's header comment).
+add_executable(symla_solve_thread_equivalence_test concurrency/solve_thread_equivalence_test.cpp)
+target_link_libraries(symla_solve_thread_equivalence_test PRIVATE symla::symla)
+target_include_directories(symla_solve_thread_equivalence_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/unit)
+add_test(NAME solve_thread_equivalence_test COMMAND symla_solve_thread_equivalence_test)
 
 # Optional ThreadSanitizer build of a small-but-nontrivial parallel
 # factorize+solve case, gated behind its own option so it doesn't slow down

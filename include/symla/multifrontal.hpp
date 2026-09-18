@@ -159,6 +159,19 @@ struct NumericFactor {
   // across all fronts, and how many pivots needed it.
   double totalPerturbation = 0.0;
   int numPerturbed = 0;
+
+  // Supernode-tree adjacency (same `parentSN`/`childrenSN`/`rootsSN` that
+  // `factorize()` derives internally to drive its own task-DAG traversal),
+  // retained here so a later `solve()` call can reuse the identical tree
+  // shape (task-DAG-parallel forward/backward solve, see solve.hpp) without
+  // reconstructing it independently -- the tree structure is a property of
+  // `analyzePattern()`'s supernode partition and does not change between a
+  // `factorize()` call and however many `solve()` calls reuse it.
+  // `parentSN[si] == -1` iff `si` is a root (equivalently, iff `si` appears
+  // in `rootsSN`); indexed by supernode index, same indexing as `fronts`.
+  std::vector<int> parentSN;
+  std::vector<std::vector<int>> childrenSN;
+  std::vector<int> rootsSN;
 };
 
 namespace detail {
@@ -306,6 +319,13 @@ class MultifrontalFactorizer {
     for (int si = 0; si < numSN; ++si) {
       if (parentSN[si] == -1) rootsSN.push_back(si);
     }
+
+    // Retain the tree shape on the returned NumericFactor for solve.hpp's
+    // task-DAG-parallel solve to reuse (see the NumericFactor::parentSN
+    // comment above).
+    nf.parentSN = parentSN;
+    nf.childrenSN = childrenSN;
+    nf.rootsSN = rootsSN;
 
     // --- Numeric values of A, permuted into final order, lower triangle only. ---
     auto Aperm = detail::PermutedLower<Scalar, SparseMatrix>::build(A, sf.perm);

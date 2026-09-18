@@ -664,24 +664,57 @@ class MultifrontalFactorizer {
         const int savedEigenThreads = Eigen::nbThreads();
         Eigen::setNbThreads(1);
 
-        // omp_set_num_threads() changes process-global OpenMP state (the
-        // "icv" the runtime consults whenever a new parallel region opens
-        // without an explicit num_threads() clause), so it must be
-        // restored afterward -- otherwise a small/medium factorize() call
-        // that (correctly) throttles itself to a handful of threads would
-        // silently also throttle every *subsequent* factorize() call in
-        // the process, including unrelated larger ones, since
-        // omp_get_max_threads() would keep reporting the throttled value.
-        const int savedOmpMaxThreads = omp_get_max_threads();
-        omp_set_num_threads(mfOptions.num_threads > 0 ? mfOptions.num_threads : effectiveThreads);
+        // Defensively cap active OpenMP nesting to 1 level for the
+        // duration of this call. `factorize()` is meant to be the
+        // outermost/only active parallel region while it runs -- but that
+        // is an assumption about the *caller's* ambient OpenMP state
+        // (OMP_NESTED / omp_set_nested / OMP_MAX_ACTIVE_LEVELS), which
+        // this library does not control and should not trust. If the
+        // embedding process has nesting enabled (e.g. via an ambient env
+        // var, or a library it links that flips the process-global nested
+        // ICV) and this `#pragma omp parallel` is ever entered while
+        // another parallel region somewhere in the process is still
+        // active, an unguarded nested region would spawn an *additional*
+        // full-size thread team per already-active outer thread --
+        // multiplying, not adding to, the thread count (this is
+        // consistent with real-world diagnosis: `/proc/<pid>/status`
+        // showed ~257 threads, ~2x the process's own
+        // `omp_get_max_threads()` of 128, only when this factorize() ran
+        // embedded in a larger host binary, never in an isolated
+        // reproduction of the identical computation). Per the OpenMP
+        // standard, once `omp_get_max_active_levels()` is exceeded, a
+        // nested `#pragma omp parallel` is forced inactive (executes
+        // serially on the encountering thread) regardless of any
+        // `num_threads()` request -- exactly the guarantee we want here,
+        // independent of whatever the ambient environment/host process
+        // has configured. `omp_set_max_active_levels` is itself
+        // process-global state, so save/restore it the same way
+        // `Eigen::setNbThreads` above is saved/restored.
+        const int savedMaxActiveLevels = omp_get_max_active_levels();
+        omp_set_max_active_levels(1);
 
-#pragma omp parallel
+        // Request the thread-team size for *this* parallel region only,
+        // via the `num_threads()` clause below, rather than mutating the
+        // process-global `omp_set_num_threads()` ICV. The previous
+        // approach required saving/restoring that global state around the
+        // parallel region, which is not reentrant: if another thread in
+        // the same process opens its own (unrelated) OpenMP parallel
+        // region concurrently with this one -- without an explicit
+        // `num_threads()` clause of its own -- it would consult whatever
+        // this call last set `omp_set_num_threads()` to, and could
+        // observe either this call's throttled value or (worse, if the
+        // restore below races with that other region opening) an
+        // inconsistent value. A `num_threads()` clause makes the request
+        // local to this region and immune to any such interleaving.
+        const int requestedThreads = mfOptions.num_threads > 0 ? mfOptions.num_threads : effectiveThreads;
+
+#pragma omp parallel num_threads(requestedThreads)
         {
 #pragma omp single
           { parallel::runTaskDag(rootsSN, childrenSN, subtreeWeight, cutoff, processSupernode); }
         }
 
-        omp_set_num_threads(savedOmpMaxThreads);
+        omp_set_max_active_levels(savedMaxActiveLevels);
         Eigen::setNbThreads(savedEigenThreads);
       }
     } else {

@@ -542,6 +542,28 @@ class MultifrontalFactorizer {
       auto __tD0 = std::chrono::steady_clock::now();
 #endif
       // --- Factor, restricted to the eligible (fully-summed) block. ---
+      // Panel-blocking (Phase 8, dense_kernel.hpp) groups multiple pivots'
+      // trailing updates into one blocked GEMM instead of applying each
+      // rank-1/rank-2 update immediately -- a mathematically valid
+      // reassociation of the same arithmetic, but on a genuinely
+      // ill-conditioned front it can tip an already-marginal threshold-
+      // pivoting decision (accept vs. delay) differently than strict
+      // rank-1-at-a-time updates would, exactly the way `-ffma`-driven
+      // instruction-level fused-multiply-add contraction was already found
+      // to do on this codebase's own known-fragile real matrices (see
+      // CMakeLists.txt's `-ffp-contract=off` comment). The BLAS-3 win this
+      // phase targets only matters for large fronts (see dense_kernel.hpp's
+      // panel_size doc comment and the Tier-2 perf investigation that
+      // motivated it -- a handful of dominant fronts on meshes/PDE
+      // matrices, not the typical small front); below this threshold a
+      // front factors so fast either way that grouping buys nothing
+      // measurable, so panel_size is forced to 1 there (bit-for-bit the
+      // same rank-1-at-a-time reassociation the original unblocked
+      // algorithm used) purely to avoid introducing this reassociation
+      // risk where there is no performance upside to justify it.
+      DenseLDLTOptions frontOptions = options;
+      static constexpr int kPanelBlockingMinFront = 256;
+      if (nEligible < kPanelBlockingMinFront) frontOptions.panel_size = 1;
       BlockDiagonalD<Scalar> D;
       DenseLDLTResult res;
       if (mfOptions.static_pivoting) {
@@ -559,7 +581,7 @@ class MultifrontalFactorizer {
         }
         res = DenseLDLT<Scalar>::factorStatic(F, D, mfOptions.staticOptions, localExpectedSign, nEligible);
       } else {
-        res = DenseLDLT<Scalar>::factor(F, D, options, nEligible);
+        res = DenseLDLT<Scalar>::factor(F, D, frontOptions, nEligible);
       }
 #ifdef SYMLA_PROFILE
 #pragma omp critical(symla_mf_profile)

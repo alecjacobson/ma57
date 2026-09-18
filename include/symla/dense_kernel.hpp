@@ -100,6 +100,19 @@ struct DenseLDLTOptions {
   // own scale (not an absolute constant) so it behaves consistently
   // whether the matrix's natural magnitudes are ~1e-6 or ~1e6.
   double relative_pivot_floor = 1e-12;
+
+  // Phase 8 (panel-blocked dense kernel): number of columns processed per
+  // "panel" before the accumulated rank-p update from that panel's pivots
+  // is applied to the remaining trailing submatrix as a small number of
+  // large BLAS-3-style Eigen GEMM calls, instead of one rank-1/rank-2 call
+  // per pivot as the original (Phase 2) unblocked algorithm did -- see
+  // factor()'s implementation comment for the full design and rationale.
+  // Must be >= 1 (values <= 0 fall back to the default). A value >=
+  // n_eligible degenerates to exactly one panel covering the whole
+  // eligible range, which the test suite uses to cross-check the blocked
+  // and (mathematically equivalent) fully-unblocked-style code paths
+  // against each other.
+  int panel_size = 64;
 };
 
 // D is block-diagonal by construction (only 1x1 and 2x2 blocks along the
@@ -264,6 +277,69 @@ class DenseLDLT {
   // factored pivots -- i.e. it is directly usable as a multifrontal
   // "generated element" / update matrix, not just "harmless but
   // unspecified" as in the pure Phase 2 (n_eligible == n) case.
+  // Phase 8: panel-blocked, delayed-trailing-update right-looking
+  // factorization (LAPACK dsytrf/dlasyf-style; see the header comment's
+  // "no LAPACK/HSL source was read" note -- this follows the publicly
+  // documented design of a blocked-panel-with-delayed-trailing-update
+  // scheme, not any proprietary implementation).
+  //
+  // The 1x1/2x2 Bunch-Kaufman decision logic below is *exactly* the
+  // decision logic of the original (Phase 2) unblocked algorithm --
+  // unchanged thresholds, unchanged lambda/sigma/r computation, unchanged
+  // delayed-pivot conditions. The only thing this phase changes is *when*
+  // the rank-1/rank-2 trailing update from an accepted pivot is applied:
+  //
+  //   - Columns are processed in "panels" of up to `options.panel_size`
+  //     eligible columns at a time (`panelStart` .. `panelEnd`).
+  //   - Within a panel, each pivot's rank-1/rank-2 update is applied
+  //     *lazily and only to the specific column(s) the pivot-search logic
+  //     is about to read* (the current column `k`, and -- only if the
+  //     lambda/sigma test needs it -- the candidate partner column `r`,
+  //     which may lie anywhere in [k, effEnd), not necessarily inside the
+  //     panel's own column range). This is done via `ensureColumnCurrent`,
+  //     which brings a column's live rows [k, n) up to date with however
+  //     many of this panel's pivots-so-far haven't yet been applied to it
+  //     (tracked per-column via `appliedCount`), using a small GEMV over
+  //     just the panel-local L/D buffers (`Lbuf`/`Dbuf`) -- O(m * p) where
+  //     p <= panel_size, instead of the O(m) rank-1 update the unblocked
+  //     algorithm applied to the *entire* trailing matrix after literally
+  //     every pivot.
+  //   - A column examined as a candidate `r` during the search is not
+  //     always the column that ends up chosen (e.g. the sigma test can
+  //     still land on accept_1x1_at_k). Such a column keeps whatever
+  //     partial correction `ensureColumnCurrent` already applied to it;
+  //     `appliedCount` tracks exactly how much, so any later touch (as a
+  //     future `k` or a future `r`) only applies the remaining delta --
+  //     never re-derives or double-applies anything.
+  //   - Once the panel finishes (either by reaching `panel_size` columns,
+  //     or by stopping early because a pivot was delayed/degenerate --
+  //     exactly the original algorithm's delayed-pivot `break`), any
+  //     column in the live trailing region that still carries a *partial*
+  //     panel-local correction (i.e. was examined as an `r` but never
+  //     finalized as a pivot) is first reverted back to its pre-panel
+  //     ("raw") state, so that a single blocked rank-p update --
+  //     `trailingBeyondPanel -= Lpanel * Dpanel * Lpanel^T`, expressed as
+  //     genuine Eigen block GEMM calls -- can then be applied uniformly to
+  //     the *entire* remaining trailing extent at once. This is the
+  //     BLAS-3-throughput step the whole scheme exists to enable.
+  //
+  // Row/column swaps (`panelSwap`, a thin wrapper around the original
+  // `swap_rowcol` that additionally keeps `Lbuf` rows and `appliedCount`
+  // in sync with whatever physical row/column they belong to) can move a
+  // column from outside the panel's own range into pivot position (e.g. a
+  // 2x2 pivot's partner `r` found beyond `panelEnd`, within the eligible
+  // range) -- swaps always happen *before* any panel-local correction is
+  // applied for that pivot, exactly mirroring the unblocked code's
+  // ordering, so a swapped-in column's already-applied partial correction
+  // (if any) simply moves with it.
+  //
+  // A `panel_size` >= `n_eligible` collapses this to exactly one panel
+  // spanning the whole eligible range, which is mathematically equivalent
+  // to the original fully unblocked algorithm (one deferred update instead
+  // of many, but covering the same total rank -- see the correctness test
+  // suite's explicit head-to-head sweep across panel sizes, including huge
+  // ones, cross-checked against small panel sizes that stress panel-
+  // boundary logic hard even on small matrices).
   static DenseLDLTResult factor(Eigen::Ref<MatrixX> A, BlockDiagonalD<Scalar>& D_out,
                                  const DenseLDLTOptions& options = {}, int n_eligible = -1) {
     const int n = static_cast<int>(A.rows());
@@ -272,6 +348,7 @@ class DenseLDLT {
     if (effEnd < 0 || effEnd > n) throw std::invalid_argument("DenseLDLT::factor: n_eligible out of range");
 
     const double alpha = (1.0 + std::sqrt(17.0)) / 8.0;
+    const int panelSizeOpt = options.panel_size > 0 ? options.panel_size : 64;
 
     DenseLDLTResult result;
     result.perm = Eigen::VectorXi::LinSpaced(n, 0, n - 1);
@@ -364,210 +441,366 @@ class DenseLDLT {
 
     int k = 0;
     while (k < effEnd) {
-      const int m = n - k;  // trailing submatrix size (full, incl. ineligible rows)
+      // ==================== Begin one panel ====================
+      const int panelStart = k;
+      const int panelWidthTarget = std::min(panelSizeOpt, effEnd - panelStart);
+      const int panelEnd = panelStart + panelWidthTarget;
+      // +1: room for a 2x2 pivot whose first column lands exactly at
+      // panelEnd - 1 (its partner column is always < effEnd, so this is
+      // always sufficient -- see the class-level comment above).
+      const int panelCapacity = panelWidthTarget + 1;
+      const int m0 = n - panelStart;  // rows spanned by this panel's L buffer (down to n, incl. ineligible rows)
 
-      // Step 1: lambda = max_{k<i<effEnd} |A(i,k)|, at row r. Restricted to
-      // the eligible (fully-summed) block: an entry below the diagonal that
-      // lives in a not-fully-summed row can never become a pivot partner.
-      double lambda = 0.0;
-      int r = -1;
-      for (int i = k + 1; i < effEnd; ++i) {
-        const double v = std::abs(A(i, k));
-        if (v > lambda) {
-          lambda = v;
-          r = i;
+      MatrixX Lbuf = MatrixX::Zero(m0, panelCapacity);
+      BlockDiagonalD<Scalar> Dbuf;
+      Dbuf.resize(panelCapacity);
+
+      // Snapshot of this panel's starting state (i.e. reflecting every
+      // *prior* panel's effect, but none of this panel's own pivots yet),
+      // kept in lockstep with every row/column swap performed while this
+      // panel is live (see `panelSwap` below). This is the anchor every
+      // column-current computation below recomputes from -- see
+      // `setColumnRaw`'s comment for why a fresh, from-scratch recompute
+      // (rather than incremental delta application) is required for
+      // correctness once swaps are involved.
+      MatrixX Araw = A.block(panelStart, panelStart, m0, m0);
+
+      // Per physical column (offset from panelStart): how many of this
+      // panel's pivots-so-far this column's live rows currently reflect
+      // (0 == still raw / matches Araw exactly).
+      std::vector<int> appliedCount(m0, 0);
+      bool panelStoppedEarly = false;
+
+      // Sets column `col`'s live rows [k, n) (and mirrors the matching
+      // live entries of row `col`) to *exactly* "raw minus the full
+      // correction from this panel's pivot columns [0, p)", computed fresh
+      // from `Araw` every time -- never incrementally from whatever `A`
+      // currently holds. This is essential once swaps are involved: a
+      // swap can relocate a row/column whose *own* prior correction (from
+      // when it was some other physical position, e.g. column k's own
+      // corrected row was mirrored across every live column at the time)
+      // into a position that a *different*, not-yet-touched column later
+      // reads -- if that column then applied only an incremental delta
+      // (assuming its target was still raw), the portion already baked in
+      // via the earlier column's mirror would be double-subtracted. Always
+      // recomputing "raw (from the swap-tracked snapshot) minus the full
+      // rank-p correction" is idempotent: two different columns computing
+      // a shared entry (e.g. column i's row at column j, and column j's
+      // row at column i) both derive it from the same Araw/Lbuf/Dbuf state
+      // via the same symmetric formula, so whichever computes it first or
+      // last, the result is identical (up to ordinary floating-point
+      // reassociation) -- no double counting is possible.
+      auto setColumnRaw = [&](int col, int p) {
+        const int idx = col - panelStart;
+        const int rowsFrom = k - panelStart;
+        const int rowsCount = m0 - rowsFrom;  // == n - k
+        if (rowsCount <= 0) {
+          appliedCount[idx] = p;
+          return;
         }
-      }
-
-      bool accept_1x1_at_k = false;
-      bool accept_1x1_swap_kr = false;
-
-      if (lambda <= options.zero_tolerance) {
-        // No off-diagonal mass below the diagonal (or last column): the
-        // only candidate is A(k,k) itself -- but accept it only if it's
-        // not down at noise level relative to this front's own scale (see
-        // `relative_pivot_floor`'s doc comment above). Either an
-        // exactly/near-zero isolated diagonal (structurally singular here)
-        // or a numerically negligible one are both handled the same way:
-        // delay column k (and everything after) to the parent, where
-        // extend-add assembly with ancestor rows may give it real
-        // off-diagonal support.
-        const double isolatedFloor = std::max(options.zero_tolerance, options.relative_pivot_floor * orig_max);
-        if (std::abs(A(k, k)) <= isolatedFloor) {
-          break;  // delay column k (and everything after) to the parent
-        }
-        accept_1x1_at_k = true;
-      } else if (std::abs(A(k, k)) >= alpha * lambda) {
-        accept_1x1_at_k = true;
-      } else {
-        // sigma = max_{i != r, k<=i<effEnd} |A(i,r)| (restricted to the
-        // eligible block, same rationale as lambda above).
-        double sigma = 0.0;
-        for (int i = k; i < effEnd; ++i) {
-          if (i == r) continue;
-          const double v = std::abs(A(i, r));
-          if (v > sigma) sigma = v;
-        }
-
-        // Note: if sigma <= zero_tolerance (column r has no other
-        // off-diagonal mass in the trailing block), the first test below
-        // reduces to "A(k,k) still not good enough" (since it already
-        // failed the alpha*lambda test above and sigma~0 makes the LHS
-        // ~0), so it correctly falls through toward the 2x2 case unless
-        // r's own diagonal saves it.
-        if (std::abs(A(k, k)) * sigma >= alpha * lambda * lambda) {
-          accept_1x1_at_k = true;
-        } else if (std::abs(A(r, r)) >= alpha * sigma) {
-          accept_1x1_swap_kr = true;
-        }
-        // else: accept a 2x2 pivot at (k, r) -- handled by the fallthrough
-        // block below (neither accept_1x1_at_k nor accept_1x1_swap_kr set).
-      }
-
-      // Note: we deliberately do *not* apply an absolute floor to the
-      // ordinary (non-isolated) Bunch-Kaufman relative comparisons above --
-      // an experiment doing so (rejecting an about-to-be-accepted 1x1
-      // pivot whenever it fell below `relative_pivot_floor * orig_max`,
-      // falling through to try a 2x2 at (k, r) instead) was tried during
-      // Phase 5 and made real-matrix residuals *worse*, not better,
-      // presumably by forcing 2x2 pivots in cases the classical relative
-      // test had good (bounded-growth-factor) reasons to avoid. Left as a
-      // real, open item for Phase 6/7: see the Phase 5 report's notes on
-      // GHS_indef/sit100 and friends still showing elevated (~1e-2)
-      // residuals -- pure textbook Bunch-Kaufman is scale-invariant by
-      // design, and fixing this properly likely needs MA57/PARDISO-style
-      // static pivoting + regularization (already planned for Phase 7),
-      // not another ad hoc floor here.
-
-      if (accept_1x1_at_k) {
-        running_max = std::max(running_max, std::abs(A(k, k)));
-        const double d = A(k, k);
-        D_out(k, k) = d;
-        result.pivots.push_back({k, PivotKind::OneByOne});
-        if (d > 0)
-          ++result.inertia.n_pos;
-        else if (d < 0)
-          ++result.inertia.n_neg;
-        else
-          ++result.inertia.n_zero;
-
-        if (m > 1) {
-          VectorX l = A.col(k).segment(k + 1, m - 1) / d;
-          running_max = std::max(running_max, A.block(k + 1, k, m - 1, 1).cwiseAbs().maxCoeff());
-          // Rank-1 symmetric trailing update:
-          // A(i,j) -= l(i) * d * l(j)  for i,j in (k, n)
-          auto trailing = A.block(k + 1, k + 1, m - 1, m - 1);
-          trailing.noalias() -= (d * l) * l.transpose();
-          resymmetrizeTrailing(trailing);
-          A.col(k).segment(k + 1, m - 1) = l;
-          A.row(k).segment(k + 1, m - 1) = l.transpose();
-          running_max = std::max(running_max, trailing.cwiseAbs().maxCoeff());
-        }
-        ++k;
-        continue;
-      }
-
-      if (accept_1x1_swap_kr) {
-        swap_rowcol(k, r);
-        running_max = std::max(running_max, std::abs(A(k, k)));
-        const double d = A(k, k);
-        D_out(k, k) = d;
-        result.pivots.push_back({k, PivotKind::OneByOne});
-        if (d > 0)
-          ++result.inertia.n_pos;
-        else if (d < 0)
-          ++result.inertia.n_neg;
-        else
-          ++result.inertia.n_zero;
-
-        if (m > 1) {
-          VectorX l = A.col(k).segment(k + 1, m - 1) / d;
-          running_max = std::max(running_max, A.block(k + 1, k, m - 1, 1).cwiseAbs().maxCoeff());
-          auto trailing = A.block(k + 1, k + 1, m - 1, m - 1);
-          trailing.noalias() -= (d * l) * l.transpose();
-          resymmetrizeTrailing(trailing);
-          A.col(k).segment(k + 1, m - 1) = l;
-          A.row(k).segment(k + 1, m - 1) = l.transpose();
-          running_max = std::max(running_max, trailing.cwiseAbs().maxCoeff());
-        }
-        ++k;
-        continue;
-      }
-
-      // accept_2x2: bring r into position k+1 (k is already fine as-is).
-      {
-        if (r != k + 1) swap_rowcol(k + 1, r);
-        const double d11 = A(k, k);
-        const double d21 = A(k + 1, k);
-        const double d22 = A(k + 1, k + 1);
-        const double det = d11 * d22 - d21 * d21;
-
-        if (std::abs(det) <= options.zero_tolerance * std::max(1.0, running_max) * std::max(1.0, running_max)) {
-          // Degenerate 2x2 block: delay column k (and k+1 onward).
-          // Undo is unnecessary since we simply stop factoring here; the
-          // caller treats everything from k onward as delayed. (The r<->k+1
-          // swap already applied is harmless: it's still a valid symmetric
-          // permutation of the still-unfactored trailing block, and the
-          // delayed columns carry `perm` with them.)
-          break;
-        }
-
-        running_max = std::max(running_max, std::max({std::abs(d11), std::abs(d21), std::abs(d22)}));
-
-        D_out(k, k) = d11;
-        D_out(k + 1, k) = d21;
-        D_out(k, k + 1) = d21;
-        D_out(k + 1, k + 1) = d22;
-        result.pivots.push_back({k, PivotKind::TwoByTwo});
-
-        // Inertia of a 2x2 symmetric indefinite-by-construction block:
-        // det < 0 always here (Bunch-Kaufman guarantees the 2x2 case is
-        // indefinite), so one +, one -.
-        if (det < 0) {
-          ++result.inertia.n_pos;
-          ++result.inertia.n_neg;
+        if (p == 0) {
+          A.col(col).segment(k, rowsCount) = Araw.col(idx).segment(rowsFrom, rowsCount);
         } else {
-          // Shouldn't happen by construction, but handle gracefully via
-          // trace sign if it ever does (numerical edge case).
-          const double tr = d11 + d22;
-          if (tr > 0) {
-            result.inertia.n_pos += 2;
-          } else if (tr < 0) {
-            result.inertia.n_neg += 2;
-          } else {
-            ++result.inertia.n_pos;
-            ++result.inertia.n_neg;
+          // Associate as (L * D) * l_col rather than L * (D * l_col): this
+          // matches the left-to-right evaluation Eigen already performs for
+          // the deferred blocked update below (`Lpanel * Dpanel *
+          // Lpanel.transpose()`), so a column's JIT-recomputed value and the
+          // eventual bulk update agree bit-for-bit in their rank-p term's
+          // internal grouping, minimizing (not eliminating -- some
+          // reassociation relative to the fully unblocked algorithm's
+          // rank-1-at-a-time updates is unavoidable once more than one
+          // pivot is grouped into a single correction) floating-point
+          // reassociation drift on ill-conditioned/near-singular fronts.
+          MatrixX Dp = Dbuf.head(p).toDense();
+          MatrixX LD = Lbuf.block(rowsFrom, 0, rowsCount, p) * Dp;
+          VectorX Lrow = Lbuf.row(idx).segment(0, p).transpose();
+          VectorX corr = LD * Lrow;
+          A.col(col).segment(k, rowsCount) = Araw.col(idx).segment(rowsFrom, rowsCount) - corr;
+        }
+        A.row(col).segment(k, rowsCount) = A.col(col).segment(k, rowsCount).transpose();
+        appliedCount[idx] = p;
+      };
+
+      // Brings column `col`'s live rows up to date with all `p` pivots
+      // accumulated so far in this panel -- a no-op if it already is
+      // (tracked by `appliedCount`). This is what lets the pivot-search
+      // decisions below see exactly the numbers the fully unblocked
+      // algorithm would compute, without paying for a whole-trailing-
+      // matrix update on every single pivot: only the O(panel_size)
+      // columns actually touched during this panel's search pay any cost
+      // at all, and each such touch costs O(m * p) rather than O(m^2).
+      auto ensureColumnCurrent = [&](int col, int p) {
+        const int idx = col - panelStart;
+        if (appliedCount[idx] == p) return;
+        setColumnRaw(col, p);
+      };
+
+      // Full row/column swap (same physical effect as the original
+      // `swap_rowcol`) that additionally keeps this panel's L buffer,
+      // raw-snapshot, and applied-correction bookkeeping attached to
+      // whichever physical row/column they belong to.
+      auto panelSwap = [&](int i, int j) {
+        if (i == j) return;
+        swap_rowcol(i, j);
+        const int ii = i - panelStart, jj = j - panelStart;
+        Lbuf.row(ii).swap(Lbuf.row(jj));
+        Araw.row(ii).swap(Araw.row(jj));
+        Araw.col(ii).swap(Araw.col(jj));
+        std::swap(appliedCount[ii], appliedCount[jj]);
+      };
+
+      int p = 0;  // pivot *columns* accumulated in this panel so far (always == k - panelStart)
+      while (k < panelEnd) {
+        const int m = n - k;  // trailing submatrix size (full, incl. ineligible rows)
+
+        // Column k must reflect this panel's pivots-so-far before its
+        // entries are searched/read below (mirrors what the unblocked
+        // algorithm guarantees by having already updated the *entire*
+        // trailing matrix after every prior pivot).
+        ensureColumnCurrent(k, p);
+
+        // Step 1: lambda = max_{k<i<effEnd} |A(i,k)|, at row r. Restricted to
+        // the eligible (fully-summed) block: an entry below the diagonal that
+        // lives in a not-fully-summed row can never become a pivot partner.
+        double lambda = 0.0;
+        int r = -1;
+        for (int i = k + 1; i < effEnd; ++i) {
+          const double v = std::abs(A(i, k));
+          if (v > lambda) {
+            lambda = v;
+            r = i;
           }
         }
 
-        const int mm = n - (k + 2);  // rows/cols strictly below the 2x2 block
-        if (mm > 0) {
-          // inv(D2) = 1/det * [[d22, -d21], [-d21, d11]]
-          const double inv11 = d22 / det;
-          const double inv21 = -d21 / det;
-          const double inv22 = d11 / det;
+        bool accept_1x1_at_k = false;
+        bool accept_1x1_swap_kr = false;
 
-          MatrixX rhs = A.block(k + 2, k, mm, 2);  // [A(:,k) A(:,k+1)]
-          running_max = std::max(running_max, rhs.cwiseAbs().maxCoeff());
-          MatrixX L2(mm, 2);
-          L2.col(0) = rhs.col(0) * inv11 + rhs.col(1) * inv21;
-          L2.col(1) = rhs.col(0) * inv21 + rhs.col(1) * inv22;
+        if (lambda <= options.zero_tolerance) {
+          // No off-diagonal mass below the diagonal (or last column): the
+          // only candidate is A(k,k) itself -- but accept it only if it's
+          // not down at noise level relative to this front's own scale (see
+          // `relative_pivot_floor`'s doc comment above). Either an
+          // exactly/near-zero isolated diagonal (structurally singular here)
+          // or a numerically negligible one are both handled the same way:
+          // delay column k (and everything after) to the parent, where
+          // extend-add assembly with ancestor rows may give it real
+          // off-diagonal support.
+          const double isolatedFloor = std::max(options.zero_tolerance, options.relative_pivot_floor * orig_max);
+          if (std::abs(A(k, k)) <= isolatedFloor) {
+            panelStoppedEarly = true;  // delay column k (and everything after) to the parent
+            break;
+          }
+          accept_1x1_at_k = true;
+        } else if (std::abs(A(k, k)) >= alpha * lambda) {
+          accept_1x1_at_k = true;
+        } else {
+          // Column r must be brought current before it's read (sigma test,
+          // A(r,r), or -- if chosen below -- as an actual pivot column):
+          // it may lie anywhere in [k, effEnd), not necessarily inside this
+          // panel's own column range.
+          ensureColumnCurrent(r, p);
 
-          // Rank-2 symmetric trailing update:
-          // A -= L2 * D2 * L2^T, D2 = [[d11,d21],[d21,d22]]
-          MatrixX D2(2, 2);
-          D2 << d11, d21, d21, d22;
-          auto trailing = A.block(k + 2, k + 2, mm, mm);
-          trailing.noalias() -= L2 * D2 * L2.transpose();
-          resymmetrizeTrailing(trailing);
+          // sigma = max_{i != r, k<=i<effEnd} |A(i,r)| (restricted to the
+          // eligible block, same rationale as lambda above).
+          double sigma = 0.0;
+          for (int i = k; i < effEnd; ++i) {
+            if (i == r) continue;
+            const double v = std::abs(A(i, r));
+            if (v > sigma) sigma = v;
+          }
 
-          A.block(k + 2, k, mm, 2) = L2;
-          A.block(k, k + 2, 2, mm) = L2.transpose();
-          running_max = std::max(running_max, trailing.cwiseAbs().maxCoeff());
+          // Note: if sigma <= zero_tolerance (column r has no other
+          // off-diagonal mass in the trailing block), the first test below
+          // reduces to "A(k,k) still not good enough" (since it already
+          // failed the alpha*lambda test above and sigma~0 makes the LHS
+          // ~0), so it correctly falls through toward the 2x2 case unless
+          // r's own diagonal saves it.
+          if (std::abs(A(k, k)) * sigma >= alpha * lambda * lambda) {
+            accept_1x1_at_k = true;
+          } else if (std::abs(A(r, r)) >= alpha * sigma) {
+            accept_1x1_swap_kr = true;
+          }
+          // else: accept a 2x2 pivot at (k, r) -- handled by the fallthrough
+          // block below (neither accept_1x1_at_k nor accept_1x1_swap_kr set).
         }
-        k += 2;
-        continue;
+
+        // Note: we deliberately do *not* apply an absolute floor to the
+        // ordinary (non-isolated) Bunch-Kaufman relative comparisons above --
+        // an experiment doing so (rejecting an about-to-be-accepted 1x1
+        // pivot whenever it fell below `relative_pivot_floor * orig_max`,
+        // falling through to try a 2x2 at (k, r) instead) was tried during
+        // Phase 5 and made real-matrix residuals *worse*, not better,
+        // presumably by forcing 2x2 pivots in cases the classical relative
+        // test had good (bounded-growth-factor) reasons to avoid. Left as a
+        // real, open item for Phase 6/7: see the Phase 5 report's notes on
+        // GHS_indef/sit100 and friends still showing elevated (~1e-2)
+        // residuals -- pure textbook Bunch-Kaufman is scale-invariant by
+        // design, and fixing this properly likely needs MA57/PARDISO-style
+        // static pivoting + regularization (already planned for Phase 7),
+        // not another ad hoc floor here.
+
+        if (accept_1x1_at_k) {
+          running_max = std::max(running_max, std::abs(A(k, k)));
+          const double d = A(k, k);
+          D_out(k, k) = d;
+          Dbuf.diag(p) = d;
+          result.pivots.push_back({k, PivotKind::OneByOne});
+          if (d > 0)
+            ++result.inertia.n_pos;
+          else if (d < 0)
+            ++result.inertia.n_neg;
+          else
+            ++result.inertia.n_zero;
+
+          if (m > 1) {
+            running_max = std::max(running_max, A.block(k + 1, k, m - 1, 1).cwiseAbs().maxCoeff());
+            VectorX l = A.col(k).segment(k + 1, m - 1) / d;
+            Lbuf.col(p).segment(k + 1 - panelStart, m - 1) = l;
+            A.col(k).segment(k + 1, m - 1) = l;
+            A.row(k).segment(k + 1, m - 1) = l.transpose();
+          }
+          ++k;
+          ++p;
+          continue;
+        }
+
+        if (accept_1x1_swap_kr) {
+          panelSwap(k, r);
+          running_max = std::max(running_max, std::abs(A(k, k)));
+          const double d = A(k, k);
+          D_out(k, k) = d;
+          Dbuf.diag(p) = d;
+          result.pivots.push_back({k, PivotKind::OneByOne});
+          if (d > 0)
+            ++result.inertia.n_pos;
+          else if (d < 0)
+            ++result.inertia.n_neg;
+          else
+            ++result.inertia.n_zero;
+
+          if (m > 1) {
+            running_max = std::max(running_max, A.block(k + 1, k, m - 1, 1).cwiseAbs().maxCoeff());
+            VectorX l = A.col(k).segment(k + 1, m - 1) / d;
+            Lbuf.col(p).segment(k + 1 - panelStart, m - 1) = l;
+            A.col(k).segment(k + 1, m - 1) = l;
+            A.row(k).segment(k + 1, m - 1) = l.transpose();
+          }
+          ++k;
+          ++p;
+          continue;
+        }
+
+        // accept_2x2: bring r into position k+1 (k is already fine as-is).
+        // The swap happens before any panel-local correction is applied for
+        // this pivot, exactly mirroring the unblocked code's ordering --
+        // `r`'s already-applied partial correction (from ensureColumnCurrent
+        // above) simply moves with it via panelSwap.
+        {
+          if (r != k + 1) panelSwap(k + 1, r);
+          const double d11 = A(k, k);
+          const double d21 = A(k + 1, k);
+          const double d22 = A(k + 1, k + 1);
+          const double det = d11 * d22 - d21 * d21;
+
+          if (std::abs(det) <= options.zero_tolerance * std::max(1.0, running_max) * std::max(1.0, running_max)) {
+            // Degenerate 2x2 block: delay column k (and k+1 onward).
+            // Undo is unnecessary since we simply stop factoring here; the
+            // caller treats everything from k onward as delayed. (The r<->k+1
+            // swap already applied is harmless: it's still a valid symmetric
+            // permutation of the still-unfactored trailing block, and the
+            // delayed columns carry `perm` with them.)
+            panelStoppedEarly = true;
+            break;
+          }
+
+          running_max = std::max(running_max, std::max({std::abs(d11), std::abs(d21), std::abs(d22)}));
+
+          D_out(k, k) = d11;
+          D_out(k + 1, k) = d21;
+          D_out(k, k + 1) = d21;
+          D_out(k + 1, k + 1) = d22;
+          Dbuf.diag(p) = d11;
+          Dbuf.offdiag(p) = d21;
+          Dbuf.diag(p + 1) = d22;
+          result.pivots.push_back({k, PivotKind::TwoByTwo});
+
+          // Inertia of a 2x2 symmetric indefinite-by-construction block:
+          // det < 0 always here (Bunch-Kaufman guarantees the 2x2 case is
+          // indefinite), so one +, one -.
+          if (det < 0) {
+            ++result.inertia.n_pos;
+            ++result.inertia.n_neg;
+          } else {
+            // Shouldn't happen by construction, but handle gracefully via
+            // trace sign if it ever does (numerical edge case).
+            const double tr = d11 + d22;
+            if (tr > 0) {
+              result.inertia.n_pos += 2;
+            } else if (tr < 0) {
+              result.inertia.n_neg += 2;
+            } else {
+              ++result.inertia.n_pos;
+              ++result.inertia.n_neg;
+            }
+          }
+
+          const int mm = n - (k + 2);  // rows/cols strictly below the 2x2 block
+          if (mm > 0) {
+            // inv(D2) = 1/det * [[d22, -d21], [-d21, d11]]
+            const double inv11 = d22 / det;
+            const double inv21 = -d21 / det;
+            const double inv22 = d11 / det;
+
+            MatrixX rhs = A.block(k + 2, k, mm, 2);  // [A(:,k) A(:,k+1)]
+            running_max = std::max(running_max, rhs.cwiseAbs().maxCoeff());
+            MatrixX L2(mm, 2);
+            L2.col(0) = rhs.col(0) * inv11 + rhs.col(1) * inv21;
+            L2.col(1) = rhs.col(0) * inv21 + rhs.col(1) * inv22;
+
+            Lbuf.col(p).segment(k + 2 - panelStart, mm) = L2.col(0);
+            Lbuf.col(p + 1).segment(k + 2 - panelStart, mm) = L2.col(1);
+
+            A.block(k + 2, k, mm, 2) = L2;
+            A.block(k, k + 2, 2, mm) = L2.transpose();
+          }
+          k += 2;
+          p += 2;
+          continue;
+        }
       }
+
+      // ==================== End of panel ====================
+      // Revert any column in the live trailing region [k, n) that still
+      // carries a *partial* panel-local correction (examined as an `r`
+      // candidate during pivot search but never finalized as a pivot) back
+      // to its pre-panel ("raw", i.e. matching `Araw`) state, then apply
+      // exactly one blocked rank-p update to the entire remaining trailing
+      // extent at once -- this is the BLAS-3-throughput GEMM step the whole
+      // scheme exists to enable. See the class-level comment above
+      // `factor()` for why this is mathematically equivalent to what the
+      // unblocked algorithm would have produced (up to legitimate
+      // floating-point reassociation).
+      if (p > 0) {
+        for (int col = k; col < n; ++col) {
+          const int idx = col - panelStart;
+          if (appliedCount[idx] != 0) setColumnRaw(col, 0);
+        }
+
+        const int rowsCount = n - k;
+        if (rowsCount > 0) {
+          auto Lpanel = Lbuf.block(k - panelStart, 0, rowsCount, p);
+          MatrixX Dpanel = Dbuf.head(p).toDense();
+          auto trailingBeyond = A.block(k, k, rowsCount, rowsCount);
+          trailingBeyond.noalias() -= Lpanel * Dpanel * Lpanel.transpose();
+          resymmetrizeTrailing(trailingBeyond);
+          running_max = std::max(running_max, trailingBeyond.cwiseAbs().maxCoeff());
+        }
+      }
+
+      if (panelStoppedEarly) break;
+      // else: continue the outer loop -- k has already advanced to panelEnd
+      // (or panelEnd + 1, in the rare case where a 2x2 pivot straddled the
+      // panel boundary).
     }
 
     result.n_factored = k;

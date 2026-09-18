@@ -342,8 +342,7 @@ class MultifrontalSolver {
         MatrixXd yOwn(k, nrhs);
         if (k > 0) {
           for (int p = 0; p < k; ++p) yOwn.row(p) = Bp.row(f.rowIndices[p]) - G.row(p);
-          MatrixXd Ltop = maskedTopBlock(f);
-          Ltop.template triangularView<Eigen::UnitLower>().solveInPlace(yOwn);
+          f.Ltop.template triangularView<Eigen::UnitLower>().solveInPlace(yOwn);
           for (int p = 0; p < k; ++p) Y.row(f.rowIndices[p]) = yOwn.row(p);
         }
 
@@ -378,8 +377,7 @@ class MultifrontalSolver {
           xOwn.noalias() -= f.L.bottomRows(extra).transpose() * xExtra;
         }
 
-        MatrixXd Ltop = maskedTopBlock(f);
-        Ltop.template triangularView<Eigen::UnitLower>().transpose().solveInPlace(xOwn);
+        f.Ltop.template triangularView<Eigen::UnitLower>().transpose().solveInPlace(xOwn);
 
         for (int p = 0; p < k; ++p) X.row(f.rowIndices[p]) = xOwn.row(p);
       };
@@ -468,8 +466,7 @@ class MultifrontalSolver {
       MatrixXd yOwn(k, nrhs);
       for (int p = 0; p < k; ++p) yOwn.row(p) = Ywork.row(f.rowIndices[p]);
 
-      MatrixXd Ltop = maskedTopBlock(f);
-      Ltop.template triangularView<Eigen::UnitLower>().solveInPlace(yOwn);
+      f.Ltop.template triangularView<Eigen::UnitLower>().solveInPlace(yOwn);
 
       for (int p = 0; p < k; ++p) Ywork.row(f.rowIndices[p]) = yOwn.row(p);
 
@@ -503,30 +500,22 @@ class MultifrontalSolver {
         xOwn.noalias() -= f.L.bottomRows(extra).transpose() * xExtra;
       }
 
-      MatrixXd Ltop = maskedTopBlock(f);
-      Ltop.template triangularView<Eigen::UnitLower>().transpose().solveInPlace(xOwn);
+      f.Ltop.template triangularView<Eigen::UnitLower>().transpose().solveInPlace(xOwn);
 
       for (int p = 0; p < k; ++p) Xwork.row(f.rowIndices[p]) = xOwn.row(p);
     }
     X = std::move(Xwork);
   }
 
-  // The front's own k x k leading block of L, with the strictly-lower "d21
-  // slot" of every 2x2 pivot block zeroed out (that slot holds D's d21, not
-  // an L multiplier -- see multifrontal.hpp/dense_kernel.hpp). The
-  // remaining strictly-lower part is exactly the front-local (elimination-
-  // order) unit-lower-triangular L multipliers; the stored diagonal is
-  // whatever the dense kernel left behind (the pivot's D value or similar)
-  // and is intentionally never read -- Eigen's UnitLower triangularView
-  // always treats the diagonal as implicit 1, matching L's true structure.
-  static MatrixXd maskedTopBlock(const SupernodeFactor& f) {
-    const int k = f.nPivots;
-    MatrixXd Ltop = f.L.topRows(k);
-    for (const auto& pb : f.pivotBlocks) {
-      if (pb.kind == PivotKind::TwoByTwo) Ltop(pb.start + 1, pb.start) = 0.0;
-    }
-    return Ltop;
-  }
+  // Note: the front's own k x k leading block of L, with the strictly-lower
+  // "d21 slot" of every 2x2 pivot block zeroed out (that slot holds D's
+  // d21, not an L multiplier -- see multifrontal.hpp/dense_kernel.hpp), used
+  // to be recomputed (allocated + copied) here on every front on every
+  // solve() call via a `maskedTopBlock()` helper. It's now precomputed once
+  // per front at factorize() time and cached as `SupernodeFactor::Ltop`
+  // (see multifrontal.hpp), since it's a read-only quantity that never
+  // changes across repeated solve() calls against the same factorization --
+  // every call site above now reads `f.Ltop` directly instead.
 };
 
 }  // namespace symla

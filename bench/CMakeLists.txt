@@ -42,3 +42,9 @@ target_link_libraries(symla_parallel_diag PRIVATE symla::symla)
 # from factorize()'s, since solve()'s per-front cost is much smaller).
 add_executable(symla_solve_parallel_diag solve_parallel_diag_main.cpp)
 target_link_libraries(symla_solve_parallel_diag PRIVATE symla::symla)
+
+# Throwaway before/after timing driver for the Tier-1 performance fixes
+# (compact block-diagonal D storage, -march=native, cached masked top block
+# in solve()): analyzePattern()+factorize()+solve() end-to-end timing.
+add_executable(symla_tier1_timing tier1_timing_main.cpp)
+target_link_libraries(symla_tier1_timing PRIVATE symla::symla)

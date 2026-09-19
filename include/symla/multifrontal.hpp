@@ -579,7 +579,18 @@ class MultifrontalFactorizer {
             }
           }
         }
-        res = DenseLDLT<Scalar>::factorStatic(F, D, mfOptions.staticOptions, localExpectedSign, nEligible);
+        // Phase 9: same small-front safeguard as `frontOptions` above, and
+        // for the same reason -- blocked static pivoting reassociates the
+        // sum-of-prior-pivot-contributions that produces each column's
+        // corrected diagonal differently than the unblocked one-column-at-
+        // a-time algorithm, which (like `factor()`'s case) could in
+        // principle tip an already-marginal perturb-vs-accept floor
+        // decision. Below `kPanelBlockingMinFront` there's no measurable
+        // performance upside to justify that risk, so force panel_size = 1
+        // (bit-for-bit the original unblocked reassociation) there too.
+        StaticPivotOptions staticFrontOptions = mfOptions.staticOptions;
+        if (nEligible < kPanelBlockingMinFront) staticFrontOptions.panel_size = 1;
+        res = DenseLDLT<Scalar>::factorStatic(F, D, staticFrontOptions, localExpectedSign, nEligible);
       } else {
         res = DenseLDLT<Scalar>::factor(F, D, frontOptions, nEligible);
       }

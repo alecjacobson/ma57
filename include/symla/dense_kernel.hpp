@@ -238,6 +238,18 @@ struct StaticPivotOptions {
   // Mirrors DenseLDLTOptions::relative_pivot_floor's semantics/rationale.
   double relative_pivot_floor = 1e-8;
   double absolute_floor = 1e-300;
+
+  // Phase 9: mirrors `DenseLDLTOptions::panel_size` -- process eligible
+  // columns in panels of up to this many columns, deferring the O(m^2)
+  // trailing-submatrix update to one blocked GEMM per panel instead of
+  // applying every single column's rank-1 update immediately to the entire
+  // remaining trailing block. See `DenseLDLT::factorStatic`'s doc comment
+  // for why this needs none of `factor()`'s swap-driven raw/touched
+  // bookkeeping: with no swaps and no 2x2 pivots, every column's up-to-date
+  // value is always a simple, exact function of a per-panel raw snapshot
+  // and the panel's pivots-so-far, computed fresh (never incrementally)
+  // exactly once, when that column itself becomes the pivot.
+  int panel_size = 64;
 };
 
 template <typename Scalar>
@@ -245,6 +257,44 @@ class DenseLDLT {
  public:
   using MatrixX = Eigen::Matrix<Scalar, Eigen::Dynamic, Eigen::Dynamic>;
   using VectorX = Eigen::Matrix<Scalar, Eigen::Dynamic, 1>;
+
+  // Shared by `factor()` and `factorStatic()`: re-averages both triangles of
+  // a (potentially large) trailing block, `A(i,j) = A(j,i) = 0.5*(A(i,j) +
+  // A(j,i))`, via an explicit cache-blocked (tile-at-a-time) loop rather
+  // than a single whole-block Eigen expression -- see `factor()`'s header
+  // comment above its original inline copy of this lambda for the profiling
+  // story (a naive `((A + A.transpose()) * 0.5).eval()` on a 2745x2745
+  // front cost ~40 of ~45 total seconds; this tiled version is ~5-6x
+  // faster, bit-identical in the values it produces).
+  template <typename Block>
+  static void resymmetrizeTrailingTiled(Block trailingBlock) {
+    const int extent = static_cast<int>(trailingBlock.rows());
+    if (extent == 0) return;
+    constexpr int kTile = 64;
+    for (int jb = 0; jb < extent; jb += kTile) {
+      const int jn = std::min(kTile, extent - jb);
+      for (int ib = jb; ib < extent; ib += kTile) {
+        const int in = std::min(kTile, extent - ib);
+        if (ib == jb) {
+          for (int j = jb; j < jb + jn; ++j) {
+            for (int i = j + 1; i < jb + jn; ++i) {
+              const double avg = 0.5 * (trailingBlock(i, j) + trailingBlock(j, i));
+              trailingBlock(i, j) = avg;
+              trailingBlock(j, i) = avg;
+            }
+          }
+        } else {
+          for (int j = jb; j < jb + jn; ++j) {
+            for (int i = ib; i < ib + in; ++i) {
+              const double avg = 0.5 * (trailingBlock(i, j) + trailingBlock(j, i));
+              trailingBlock(i, j) = avg;
+              trailingBlock(j, i) = avg;
+            }
+          }
+        }
+      }
+    }
+  }
 
   // Factors `A` (n x n, symmetric; only the lower triangle is read) in
   // place. On return:
@@ -403,34 +453,7 @@ class DenseLDLT {
     // same operands, order-independent per entry) and, on the same
     // 2745x2745 front, roughly 5-6x faster than the original single-shot
     // expression.
-    auto resymmetrizeTrailing = [&](auto trailingBlock) {
-      const int extent = static_cast<int>(trailingBlock.rows());
-      if (extent == 0) return;
-      constexpr int kTile = 64;
-      for (int jb = 0; jb < extent; jb += kTile) {
-        const int jn = std::min(kTile, extent - jb);
-        for (int ib = jb; ib < extent; ib += kTile) {
-          const int in = std::min(kTile, extent - ib);
-          if (ib == jb) {
-            for (int j = jb; j < jb + jn; ++j) {
-              for (int i = j + 1; i < jb + jn; ++i) {
-                const double avg = 0.5 * (trailingBlock(i, j) + trailingBlock(j, i));
-                trailingBlock(i, j) = avg;
-                trailingBlock(j, i) = avg;
-              }
-            }
-          } else {
-            for (int j = jb; j < jb + jn; ++j) {
-              for (int i = ib; i < ib + in; ++i) {
-                const double avg = 0.5 * (trailingBlock(i, j) + trailingBlock(j, i));
-                trailingBlock(i, j) = avg;
-                trailingBlock(j, i) = avg;
-              }
-            }
-          }
-        }
-      }
-    };
+    auto resymmetrizeTrailing = [&](auto trailingBlock) { resymmetrizeTrailingTiled(trailingBlock); };
 
     auto swap_rowcol = [&](int i, int j) {
       if (i == j) return;
@@ -858,6 +881,41 @@ class DenseLDLT {
   // -- static pivoting never delays a column to the parent front, by
   // construction (see multifrontal.hpp's Phase 7 notes on why this
   // simplifies the driver's bookkeeping).
+  //
+  // Phase 9: panel-blocked, delayed-trailing-update, exactly like `factor()`
+  // (see that function's header comment for the general BLAS-3-throughput
+  // motivation) but *substantially* simpler, because static pivoting has
+  // neither row/column swaps nor 2x2 pivots: every column is examined
+  // exactly once, in fixed physical order, and finalized unconditionally the
+  // moment it's examined (never held as a tentative "candidate partner" that
+  // might later be discarded, unlike `factor()`'s `r`). Consequently there
+  // is no need for `factor()`'s `appliedCount`/"touched but not finalized,
+  // revert to raw" bookkeeping at all: within a panel spanning
+  // `[panelStart, panelEnd)`, column `k`'s up-to-date diagonal and
+  // below-diagonal entries are always exactly
+  //   raw(k) - Lbuf.block(k-panelStart, 0, ..., p) * Dbuf.head(p) * Lbuf.row(k-panelStart, 0, p)^T
+  // where `p = k - panelStart` is the number of this panel's pivots already
+  // finalized -- a single fresh computation against a per-panel raw
+  // snapshot (`Araw`, only `m0 x panelWidth`, far smaller than `factor()`'s
+  // `m0 x m0` snapshot since there is nothing to swap into it), performed
+  // exactly once per column, immediately before that column is used as the
+  // pivot. Once a panel's columns are all finalized, one blocked GEMM
+  // (`Lpanel * Dpanel * Lpanel^T`, `Dpanel` a pure diagonal since every
+  // static pivot is 1x1) applies the panel's combined correction to the
+  // entire trailing extent beyond the panel, followed by one resymmetrize --
+  // mirroring `factor()`'s reasoning for why resymmetrization timing (once
+  // per panel, not once per column) matters numerically, verified for this
+  // function too via a standalone head-to-head sweep across panel_size in
+  // {1,2,4,...,huge} on random SPD/quasidefinite/KKT-shaped dense matrices
+  // (inertia, perturbation counts, and reconstruction residual all agree
+  // closely across panel sizes), plus this project's existing `ctest` suite
+  // (`kkt_static_pivoting_test.cpp`, `dense_kernel_test.cpp`, and the
+  // multifrontal correctness/real-matrix tests, which exercise this
+  // function at its new default `panel_size = 64` on fronts both above and
+  // below that width).
+  // `options.panel_size >= n_eligible` collapses this to exactly one panel
+  // spanning the whole eligible range -- mathematically equivalent to the
+  // original fully unblocked algorithm.
   static DenseLDLTResult factorStatic(Eigen::Ref<MatrixX> A, BlockDiagonalD<Scalar>& D_out,
                                        const StaticPivotOptions& options, const std::vector<int>& expectedSign,
                                        int n_eligible = -1) {
@@ -880,73 +938,118 @@ class DenseLDLT {
     const double delta = options.delta > 0.0 ? options.delta : std::sqrt(std::numeric_limits<double>::epsilon()) * orig_max;
     const double floor = std::max(options.absolute_floor, options.relative_pivot_floor * orig_max);
 
-    auto resymmetrizeTrailing = [&](auto trailingBlock) {
-      const int extent = static_cast<int>(trailingBlock.rows());
-      for (int j = 0; j < extent; ++j) {
-        for (int i = j + 1; i < extent; ++i) {
-          const double avg = 0.5 * (trailingBlock(i, j) + trailingBlock(j, i));
-          trailingBlock(i, j) = avg;
-          trailingBlock(j, i) = avg;
+    const int panelSizeOpt = options.panel_size > 0 ? options.panel_size : 64;
+
+    int k = 0;
+    while (k < effEnd) {
+      const int panelStart = k;
+      const int panelWidth = std::min(panelSizeOpt, effEnd - panelStart);
+      const int panelEnd = panelStart + panelWidth;
+      const int m0 = n - panelStart;  // rows spanned by this panel's L buffer (down to n)
+
+      // Raw snapshot of just this panel's own columns (only m0 x panelWidth,
+      // not m0 x m0 as `factor()` needs -- there is nothing to swap into
+      // this snapshot, so it never needs to cover columns outside the
+      // panel). Row offset r (0-based from panelStart) of column-offset c
+      // holds A(panelStart + r, panelStart + c) as of the start of this
+      // panel (i.e. reflecting every prior panel's effect, none of this
+      // one's).
+      MatrixX Araw = A.block(panelStart, panelStart, m0, panelWidth);
+
+      MatrixX Lbuf = MatrixX::Zero(m0, panelWidth);
+      VectorX Dbuf(panelWidth);
+
+      for (; k < panelEnd; ++k) {
+        const int idx = k - panelStart;         // this column's offset within the panel
+        const int rowsCount = m0 - idx;          // == n - k
+
+        // Column k's up-to-date (diagonal-and-below) entries: raw minus the
+        // correction from this panel's `idx` pivots finalized so far,
+        // computed fresh from `Araw`/`Lbuf`/`Dbuf` every time -- see the
+        // class-level comment above this function for why no incremental
+        // update-and-revert bookkeeping is needed here (unlike `factor()`):
+        // static pivoting never swaps, and a column is only ever touched
+        // once, exactly when it becomes pivot k.
+        VectorX col;
+        if (idx == 0) {
+          col = Araw.col(0).segment(0, rowsCount);
+        } else {
+          VectorX Lrow = Lbuf.row(idx).segment(0, idx).transpose();
+          VectorX Dl = Lrow.cwiseProduct(Dbuf.segment(0, idx));
+          col = Araw.col(idx).segment(idx, rowsCount) - Lbuf.block(idx, 0, rowsCount, idx) * Dl;
+        }
+
+        const double a_kk = col(0);
+        const int sign = (k < static_cast<int>(expectedSign.size())) ? expectedSign[k] : 0;
+
+        double d = a_kk;
+        double applied = 0.0;
+        bool needPerturb = false;
+        if (sign > 0) {
+          needPerturb = a_kk < floor;
+        } else if (sign < 0) {
+          needPerturb = a_kk > -floor;
+        } else {
+          needPerturb = std::abs(a_kk) < floor;
+        }
+
+        if (needPerturb) {
+          // IPOPT/PARDISO-SBK-style: add a single sign-matched perturbation
+          // of magnitude `delta` and use whatever pivot that produces --
+          // deliberately NOT forced/looped to guarantee an acceptable
+          // magnitude or sign within this single pass. If `delta` isn't large
+          // enough (e.g. a_kk had the wrong sign by more than `delta`), the
+          // resulting pivot may still be small or wrong-signed; that is
+          // exactly the case the inertia-controlled retry loop in
+          // solver.hpp's `factorizeStaticRegularized()` is meant to detect
+          // (via a mismatched `inertia()` afterwards) and correct by
+          // re-factoring from scratch with `delta` escalated, not something
+          // this single-pass function silently papers over.
+          const double s = (sign != 0) ? static_cast<double>(sign) : (a_kk >= 0.0 ? 1.0 : -1.0);
+          d = a_kk + s * delta;
+          applied = d - a_kk;
+        }
+
+        D_out(k, k) = d;
+        Dbuf(idx) = d;
+        result.pivots.push_back({k, PivotKind::OneByOne});
+        if (applied != 0.0) {
+          result.total_perturbation += std::abs(applied);
+          ++result.num_perturbed;
+        }
+        if (d > 0)
+          ++result.inertia.n_pos;
+        else if (d < 0)
+          ++result.inertia.n_neg;
+        else
+          ++result.inertia.n_zero;
+
+        running_max = std::max(running_max, std::abs(d));
+        if (rowsCount > 1) {
+          running_max = std::max(running_max, col.segment(1, rowsCount - 1).cwiseAbs().maxCoeff());
+          VectorX l = col.segment(1, rowsCount - 1) / d;
+          Lbuf.col(idx).segment(idx + 1, rowsCount - 1) = l;
+          A.col(k).segment(k + 1, rowsCount - 1) = l;
+          A.row(k).segment(k + 1, rowsCount - 1) = l.transpose();
         }
       }
-    };
 
-    for (int k = 0; k < effEnd; ++k) {
-      const int m = n - k;
-      const double a_kk = A(k, k);
-      const int sign = (k < static_cast<int>(expectedSign.size())) ? expectedSign[k] : 0;
-
-      double d = a_kk;
-      double applied = 0.0;
-      bool needPerturb = false;
-      if (sign > 0) {
-        needPerturb = a_kk < floor;
-      } else if (sign < 0) {
-        needPerturb = a_kk > -floor;
-      } else {
-        needPerturb = std::abs(a_kk) < floor;
-      }
-
-      if (needPerturb) {
-        // IPOPT/PARDISO-SBK-style: add a single sign-matched perturbation
-        // of magnitude `delta` and use whatever pivot that produces --
-        // deliberately NOT forced/looped to guarantee an acceptable
-        // magnitude or sign within this single pass. If `delta` isn't large
-        // enough (e.g. a_kk had the wrong sign by more than `delta`), the
-        // resulting pivot may still be small or wrong-signed; that is
-        // exactly the case the inertia-controlled retry loop in
-        // solver.hpp's `factorizeStaticRegularized()` is meant to detect
-        // (via a mismatched `inertia()` afterwards) and correct by
-        // re-factoring from scratch with `delta` escalated, not something
-        // this single-pass function silently papers over.
-        const double s = (sign != 0) ? static_cast<double>(sign) : (a_kk >= 0.0 ? 1.0 : -1.0);
-        d = a_kk + s * delta;
-        applied = d - a_kk;
-      }
-
-      D_out(k, k) = d;
-      result.pivots.push_back({k, PivotKind::OneByOne});
-      if (applied != 0.0) {
-        result.total_perturbation += std::abs(applied);
-        ++result.num_perturbed;
-      }
-      if (d > 0)
-        ++result.inertia.n_pos;
-      else if (d < 0)
-        ++result.inertia.n_neg;
-      else
-        ++result.inertia.n_zero;
-
-      running_max = std::max(running_max, std::abs(d));
-      if (m > 1) {
-        VectorX l = A.col(k).segment(k + 1, m - 1) / d;
-        running_max = std::max(running_max, A.block(k + 1, k, m - 1, 1).cwiseAbs().maxCoeff());
-        auto trailing = A.block(k + 1, k + 1, m - 1, m - 1);
-        trailing.noalias() -= (d * l) * l.transpose();
-        resymmetrizeTrailing(trailing);
-        A.col(k).segment(k + 1, m - 1) = l;
-        A.row(k).segment(k + 1, m - 1) = l.transpose();
-        running_max = std::max(running_max, trailing.cwiseAbs().maxCoeff());
+      // ==================== End of panel ====================
+      // One blocked rank-p update (Lpanel * Dpanel * Lpanel^T, Dpanel purely
+      // diagonal since every static pivot is 1x1) applied to the entire
+      // trailing extent beyond the panel, via genuine Eigen block GEMM --
+      // this is the BLAS-3-throughput step the whole scheme exists to
+      // enable -- followed by one resymmetrize (mirrors `factor()`'s timing:
+      // once per panel, not once per column; see this function's
+      // class-level comment above).
+      const int rowsBeyond = n - panelEnd;
+      if (rowsBeyond > 0) {
+        auto Lpanel = Lbuf.block(panelEnd - panelStart, 0, rowsBeyond, panelWidth);
+        MatrixX LD = Lpanel * Dbuf.asDiagonal();
+        auto trailingBeyond = A.block(panelEnd, panelEnd, rowsBeyond, rowsBeyond);
+        trailingBeyond.noalias() -= LD * Lpanel.transpose();
+        resymmetrizeTrailingTiled(trailingBeyond);
+        running_max = std::max(running_max, trailingBeyond.cwiseAbs().maxCoeff());
       }
     }
 
